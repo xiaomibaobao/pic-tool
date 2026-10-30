@@ -1,0 +1,9057 @@
+mod mcp;
+pub fn run_mcp() {
+    mcp::run();
+}
+mod animation_size;
+mod click_through;
+mod floating_collapse;
+mod heic_input;
+mod png_candidate;
+
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Cursor, Write},
+    net::{Shutdown, TcpStream},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use chrono::{Local, Utc};
+use fast_image_resize::{
+    images::Image as FastImage, PixelType as FastPixelType, Resizer as FastResizer,
+};
+use hmac::{Hmac, Mac};
+use image::{
+    codecs::{
+        avif::AvifEncoder,
+        gif::{GifDecoder, GifEncoder, Repeat},
+        jpeg::JpegEncoder,
+        png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+        webp::WebPEncoder,
+    },
+    imageops::FilterType,
+    AnimationDecoder, DynamicImage, Frame, GenericImageView, ImageDecoder, ImageEncoder,
+};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use rayon::prelude::*;
+use regex::Regex;
+use reqwest::{blocking::Client, Method, StatusCode};
+use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use ssh2::{CheckResult, KnownHostFileKind, Session};
+use tauri::{
+    image::Image as TauriImage,
+    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, Theme, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
+use url::Url;
+use webp::{
+    AnimDecoder as AnimatedWebPDecoder, AnimEncoder as AnimatedWebPEncoder,
+    AnimFrame as AnimatedWebPFrame,
+};
+use webp::{Encoder as LossyWebPEncoder, WebPConfig};
+
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "jfif", "png", "webp", "gif", "avif", "bmp", "tif", "tiff", "ico", "qoi", "tga",
+    "heic", "heif",
+];
+
+#[derive(Default)]
+struct SelectedFolders {
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    export: Option<PathBuf>,
+}
+
+struct DesktopState {
+    watcher: Mutex<Option<RecommendedWatcher>>,
+    watcher_settings: Mutex<Option<WatcherSettings>>,
+    folders: Mutex<SelectedFolders>,
+    source_files: Mutex<HashSet<PathBuf>>,
+    pending_corner_drop: Mutex<Vec<String>>,
+    /// Clipboard content that created the lazy floating window. Keeping the
+    /// first payload here avoids losing it while WebView2 mounts its listeners.
+    pending_clipboard: Mutex<Option<PendingClipboard>>,
+    processing: Arc<Mutex<HashSet<PathBuf>>>,
+    quitting: AtomicBool,
+    tray_available: AtomicBool,
+    minimize_to_tray: AtomicBool,
+    show_in_taskbar_dock: AtomicBool,
+    clipboard_monitor_enabled: AtomicBool,
+    /// Timestamp until which clipboard content was written by PicLite itself.
+    /// The monitor must record it but must not feed the result back through the
+    /// compressor, otherwise a copied result would be compressed repeatedly.
+    clipboard_ignore_until_ms: AtomicU64,
+    shortcut_config_lock: Mutex<()>,
+    /// The drop window is placed in its initial corner exactly once. Later
+    /// show/resize calls preserve the position selected by dragging it.
+    floating_corner: Mutex<String>,
+    floating_click_through: AtomicBool,
+    floating_toggle_regions: Mutex<HashMap<String, click_through::ToggleRegion>>,
+    floating_cursor_ignored: Mutex<Option<bool>>,
+    floating_collapsed: AtomicBool,
+    floating_expanded_geometry: Mutex<Option<floating_collapse::ExpandedGeometry>>,
+    dropzone_positioned: AtomicBool,
+}
+
+impl Default for DesktopState {
+    fn default() -> Self {
+        Self {
+            watcher: Mutex::new(None),
+            watcher_settings: Mutex::new(None),
+            folders: Mutex::new(SelectedFolders::default()),
+            source_files: Mutex::new(HashSet::new()),
+            pending_corner_drop: Mutex::new(Vec::new()),
+            pending_clipboard: Mutex::new(None),
+            processing: Arc::new(Mutex::new(HashSet::new())),
+            quitting: AtomicBool::new(false),
+            tray_available: AtomicBool::new(false),
+            minimize_to_tray: AtomicBool::new(true),
+            show_in_taskbar_dock: AtomicBool::new(true),
+            clipboard_monitor_enabled: AtomicBool::new(false),
+            clipboard_ignore_until_ms: AtomicU64::new(0),
+            shortcut_config_lock: Mutex::new(()),
+            floating_corner: Mutex::new("bottom-right".to_string()),
+            floating_click_through: AtomicBool::new(false),
+            floating_toggle_regions: Mutex::new(HashMap::new()),
+            floating_cursor_ignored: Mutex::new(None),
+            floating_collapsed: AtomicBool::new(false),
+            floating_expanded_geometry: Mutex::new(None),
+            dropzone_positioned: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeDesktopPreferences {
+    minimize_to_tray: bool,
+    #[serde(default = "default_true")]
+    show_in_taskbar_dock: bool,
+    clipboard_watcher_enabled: bool,
+}
+
+fn user_facing_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
+}
+
+/// UI preferences live in the native application config directory instead of
+/// only in a webview's localStorage. The main window and the floating dock are
+/// separate webviews, so this gives both of them one durable source of truth.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeAppProfile {
+    settings: serde_json::Value,
+    custom_presets: serde_json::Value,
+    active_preset_id: String,
+    local_fonts: Vec<String>,
+    #[serde(default)]
+    desktop_preferences: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportedFontPayload {
+    family: String,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredImportedFont {
+    family: String,
+    file_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportedFontData {
+    family: String,
+    data: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    current_version: String,
+    latest_version: String,
+    available: bool,
+    release_url: String,
+    published_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    published_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickCompressSettings {
+    #[serde(default = "default_manual_mode")]
+    mode: String,
+    quality: u8,
+    scale: f64,
+    format: String,
+    strip_metadata: bool,
+    prevent_larger: bool,
+    export_mode: String,
+    export_suffix: String,
+    #[serde(default)]
+    rename_template: String,
+    fixed_folder: Option<String>,
+    #[serde(default)]
+    target_size_kb: u32,
+    #[serde(default)]
+    resize: bool,
+    #[serde(default)]
+    resize_mode: String,
+    #[serde(default)]
+    max_width: u32,
+    #[serde(default)]
+    max_height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeImageWatermark {
+    data: String,
+    image_scale: f64,
+    opacity: u8,
+    rotation: f64,
+    layout: String,
+    density: f64,
+    position_x: f64,
+    position_y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeAnimationWatermark {
+    kind: String,
+    data: String,
+    opacity: u8,
+    text: String,
+    blind_strength: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShortcutBindings {
+    enabled: bool,
+    #[serde(default)]
+    toggle_dropzone: String,
+    #[serde(default)]
+    optimise_clipboard: String,
+    #[serde(default)]
+    show_main: String,
+    #[serde(default)]
+    show_gallery: String,
+    #[serde(default)]
+    upload_current: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupRequest {
+    folder: String,
+    suffix: String,
+    older_than_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupResult {
+    deleted: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRenameRequest {
+    root_folder: String,
+    folder_pattern: String,
+    rename_template: String,
+    first_padding: usize,
+    second_padding: usize,
+    #[serde(default)]
+    word_separator: String,
+    #[serde(default)]
+    preserve_original: bool,
+    #[serde(default)]
+    output_format: String,
+    #[serde(default = "default_batch_quality")]
+    quality: u8,
+}
+
+fn default_batch_quality() -> u8 {
+    86
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRenameEntry {
+    source: String,
+    target: String,
+    source_name: String,
+    target_name: String,
+    matched_folder: Option<String>,
+    code: Option<String>,
+    ready: bool,
+    unchanged: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRenameResult {
+    entries: Vec<BatchRenameEntry>,
+    matched: usize,
+    renamed: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickCompressResult {
+    source: String,
+    output: Option<String>,
+    original_bytes: Option<u64>,
+    output_bytes: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    kept_original: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompressedAnimationData {
+    data: String,
+    mime_type: String,
+    extension: String,
+    width: u32,
+    height: u32,
+    kept_original: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatcherSettings {
+    #[serde(default)]
+    profiles: Vec<WatcherSettings>,
+    #[serde(default)]
+    folder_rename: Option<BatchRenameRequest>,
+    #[serde(default)]
+    only_when_needed: bool,
+    #[serde(default = "default_true")]
+    notify_on_complete: bool,
+    #[serde(default)]
+    show_floating_result: bool,
+    input_folder: String,
+    #[serde(default)]
+    input_folders: Vec<String>,
+    output_folder: String,
+    #[serde(default)]
+    output_suffix: String,
+    #[serde(default)]
+    rename_template: String,
+    mode: String,
+    quality: u8,
+    scale: f64,
+    format: String,
+    resize: bool,
+    #[serde(default)]
+    resize_mode: String,
+    max_width: u32,
+    max_height: u32,
+    strip_metadata: bool,
+    #[serde(default = "default_true")]
+    prevent_larger: bool,
+    #[serde(default)]
+    target_size_kb: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_manual_mode() -> String {
+    "manual".to_string()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeImage {
+    name: String,
+    #[serde(rename = "type")]
+    mime_type: String,
+    path: String,
+    data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeImageEntry {
+    name: String,
+    #[serde(rename = "type")]
+    mime_type: String,
+    path: String,
+    original_bytes: u64,
+    width: u32,
+    height: u32,
+    thumbnail_type: String,
+    thumbnail_data: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageImportProgress {
+    current: usize,
+    total: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct ClipboardImage {
+    data: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PendingClipboard {
+    Paths { paths: Vec<String> },
+    Image { data: String },
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemFontInfo {
+    family: String,
+    path: String,
+    face_index: u32,
+}
+
+#[derive(Serialize)]
+struct SystemFontData {
+    data: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatcherEvent {
+    id: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    file: Option<String>,
+    output: Option<String>,
+    original_bytes: Option<u64>,
+    output_bytes: Option<u64>,
+    message: Option<String>,
+    time: u128,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatcherState {
+    active: bool,
+    settings: Option<WatcherSettings>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeExportItem {
+    source_path: Option<String>,
+    output_name: String,
+    data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportPayload {
+    mode: String,
+    #[allow(dead_code)]
+    suffix: String,
+    fixed_folder: Option<String>,
+    items: Vec<NativeExportItem>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeUploadPayload {
+    provider: String,
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    username: String,
+    port: u16,
+    remote_path: String,
+    public_base_url: String,
+    key_path: String,
+    #[serde(default = "default_true")]
+    path_style: bool,
+    secret: String,
+    file_name: String,
+    mime_type: String,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeUploadProfile {
+    provider: String,
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    username: String,
+    port: u16,
+    remote_path: String,
+    public_base_url: String,
+    key_path: String,
+    #[serde(default = "default_true")]
+    path_style: bool,
+    secret: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadResult {
+    url: String,
+    remote_path: String,
+}
+
+#[derive(Serialize)]
+struct CommandResult {
+    ok: bool,
+    paths: Option<Vec<String>>,
+    error: Option<String>,
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn watcher_event(event_type: &str, message: Option<String>) -> WatcherEvent {
+    let time = now_ms();
+    WatcherEvent {
+        id: format!("{time:x}-{:x}", std::process::id()),
+        event_type: event_type.to_string(),
+        file: None,
+        output: None,
+        original_bytes: None,
+        output_bytes: None,
+        message,
+        time,
+    }
+}
+
+fn emit_event(app: &AppHandle, event: WatcherEvent) {
+    let _ = app.emit("watcher:event", event);
+}
+
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| IMAGE_EXTENSIONS.contains(&value.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Collect supported images from a folder tree without following symlinked
+/// directories. Sorting keeps the queue stable across platforms and makes a
+/// folder import predictable for the user.
+fn collect_image_paths(root: &Path) -> Vec<PathBuf> {
+    let mut folders = vec![root.to_path_buf()];
+    let mut images = Vec::new();
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = fs::read_dir(folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                folders.push(path);
+            } else if file_type.is_file() && is_image(&path) {
+                images.push(path);
+            }
+        }
+    }
+    images.sort_by(|left, right| {
+        left.to_string_lossy()
+            .to_lowercase()
+            .cmp(&right.to_string_lossy().to_lowercase())
+    });
+    images
+}
+
+fn collect_initial_watch_paths(source_root: &Path, rule: &WatcherSettings) -> Vec<PathBuf> {
+    let generated_root = if rule.output_folder.is_empty() {
+        Some(source_root.join("PicLite"))
+    } else if rule.output_folder == "@same-folder" {
+        None
+    } else {
+        Some(PathBuf::from(&rule.output_folder))
+    };
+    collect_image_paths(source_root)
+        .into_iter()
+        .filter(|path| {
+            !registered_output(path)
+                && !generated_root
+                    .as_ref()
+                    .is_some_and(|output| path.starts_with(output))
+        })
+        .collect()
+}
+
+fn padded_capture(value: &str, width: usize) -> String {
+    value
+        .parse::<u64>()
+        .map(|number| format!("{number:0width$}", width = width.clamp(1, 12)))
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn batch_rename_name(
+    template: &str,
+    base: &str,
+    extension: &str,
+    folder: &str,
+    matched: &str,
+    captures: &[String],
+    code: &str,
+    word_separator: &str,
+    index: usize,
+) -> String {
+    let template = if template.trim().is_empty() {
+        "{code}_{name}"
+    } else {
+        template.trim()
+    };
+    let separated_base = if word_separator.is_empty() {
+        base.to_string()
+    } else {
+        words_with_separator(base, word_separator)
+    };
+    let mut value = template
+        .replace("{name:words}", &words_with_separator(base, word_separator))
+        .replace("{name:initials}", &word_initials(base, word_separator))
+        .replace("{name}", &separated_base)
+        .replace("{ext}", extension)
+        .replace("{folder}", folder)
+        .replace("{match}", matched)
+        .replace("{code}", code)
+        .replace("{index}", &index.to_string());
+    for (capture_index, capture) in captures.iter().enumerate().skip(1) {
+        value = value
+            .replace(&format!("{{{capture_index}}}"), capture)
+            .replace(
+                &format!("{{{capture_index}:initial}}"),
+                &capture
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_default(),
+            )
+            .replace(
+                &format!("{{{capture_index}:initials}}"),
+                &word_initials(capture, word_separator),
+            )
+            .replace(
+                &format!("{{{capture_index}:words}}"),
+                &words_with_separator(capture, word_separator),
+            );
+    }
+    for width in 1..=8 {
+        value = value.replace(
+            &format!("{{index:0{width}}}"),
+            &format!("{index:0width$}", width = width),
+        );
+    }
+    if !template.contains("{ext}") {
+        value = format!("{value}.{extension}");
+    }
+    safe_file_name(&value)
+}
+
+fn word_parts(value: &str) -> Vec<&str> {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn words_with_separator(value: &str, separator: &str) -> String {
+    word_parts(value).join(separator)
+}
+
+fn word_initials(value: &str, separator: &str) -> String {
+    word_parts(value)
+        .iter()
+        .filter_map(|word| word.chars().next())
+        .map(|c| c.to_uppercase().to_string())
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn rename_code(captures: &[String], request: &BatchRenameRequest) -> String {
+    if captures.len() == 1 {
+        return captures[0].clone();
+    }
+    captures
+        .iter()
+        .skip(1)
+        .enumerate()
+        .map(|(i, value)| {
+            padded_capture(
+                value,
+                if i == 0 {
+                    request.first_padding
+                } else {
+                    request.second_padding
+                },
+            )
+        })
+        .collect()
+}
+
+fn watched_output_name(
+    path: &Path,
+    settings: &WatcherSettings,
+    extension: &str,
+    bytes: usize,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
+    let base = path.file_stem().and_then(|v| v.to_str()).unwrap_or("image");
+    if let Some(rule) = &settings.folder_rename {
+        let pattern = Regex::new(&rule.folder_pattern).map_err(|e| e.to_string())?;
+        let (folder, matched, captures) =
+            folder_match_for_path(path, Path::new(&settings.input_folder), &pattern)
+                .ok_or_else(|| "父目录中没有匹配项，已保留原图".to_string())?;
+        return Ok(batch_rename_name(
+            &rule.rename_template,
+            base,
+            extension,
+            &folder,
+            &matched,
+            &captures,
+            &rename_code(&captures, rule),
+            &rule.word_separator,
+            1,
+        ));
+    }
+    let suffix = if settings.output_suffix.trim().is_empty() {
+        "-piclite"
+    } else {
+        settings.output_suffix.trim()
+    };
+    Ok(render_output_name(
+        &settings.rename_template,
+        base,
+        suffix,
+        extension,
+        bytes,
+        width,
+        height,
+    ))
+}
+
+fn registered_output(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    fs::read_to_string(parent.join(".piclite-generated.txt"))
+        .unwrap_or_default()
+        .lines()
+        .any(|line| Path::new(line) == canonical)
+}
+
+fn watched_file_needs_processing(path: &Path, settings: &WatcherSettings) -> Result<bool, String> {
+    if !settings.only_when_needed || settings.folder_rename.is_some() {
+        return Ok(true);
+    }
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    let decoded = decode_static_oriented(&data)?;
+    let (width, height) = decoded.dimensions();
+    let format_matches = settings.format == "keep"
+        || image::guess_format(&data).ok()
+            == Some(match settings.format.as_str() {
+                "image/jpeg" => image::ImageFormat::Jpeg,
+                "image/webp" => image::ImageFormat::WebP,
+                _ => image::ImageFormat::Png,
+            });
+    Ok(!format_matches || target_dimensions(width, height, settings) != (width, height))
+}
+
+fn folder_match_for_path(
+    path: &Path,
+    root: &Path,
+    pattern: &Regex,
+) -> Option<(String, String, Vec<String>)> {
+    let mut current = path.parent();
+    while let Some(folder) = current {
+        if !folder.starts_with(root) {
+            break;
+        }
+        let folder_name = folder
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if let Some(captures) = pattern.captures(folder_name) {
+            let values = (0..captures.len())
+                .map(|index| {
+                    captures
+                        .get(index)
+                        .map(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            return Some((folder_name.to_string(), values[0].clone(), values));
+        }
+        current = folder.parent();
+    }
+    None
+}
+
+fn path_collision_key(path: &Path) -> String {
+    user_facing_path(path).replace('\\', "/").to_lowercase()
+}
+
+fn build_batch_rename_plan(request: &BatchRenameRequest) -> Result<BatchRenameResult, String> {
+    let root = fs::canonicalize(PathBuf::from(request.root_folder.trim()))
+        .map_err(|_| "重命名目录不存在或无法访问".to_string())?;
+    if !root.is_dir() {
+        return Err("重命名目标不是文件夹".to_string());
+    }
+    if request.folder_pattern.trim().is_empty() {
+        return Err("请填写文件夹匹配规则".into());
+    }
+    let pattern = Regex::new(request.folder_pattern.trim())
+        .map_err(|error| format!("文件夹匹配规则无效：{error}"))?;
+
+    let images = collect_image_paths(&root);
+    let mut entries = Vec::with_capacity(images.len());
+    for (offset, source) in images.iter().enumerate() {
+        let source_name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image")
+            .to_string();
+        let base = source
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image");
+        let extension = if request.output_format.is_empty() || request.output_format == "keep" {
+            source
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("png")
+                .to_ascii_lowercase()
+        } else {
+            extension_for(source, &request.output_format)
+        };
+        let Some((matched_folder, matched_text, captures)) =
+            folder_match_for_path(source, &root, &pattern)
+        else {
+            entries.push(BatchRenameEntry {
+                source: user_facing_path(source),
+                target: String::new(),
+                source_name,
+                target_name: String::new(),
+                matched_folder: None,
+                code: None,
+                ready: false,
+                unchanged: false,
+                error: Some("父目录中没有匹配项".to_string()),
+            });
+            continue;
+        };
+        let code = rename_code(&captures, request);
+        let target_name = batch_rename_name(
+            &request.rename_template,
+            base,
+            &extension,
+            &matched_folder,
+            &matched_text,
+            &captures,
+            &code,
+            &request.word_separator,
+            offset + 1,
+        );
+        let target = source.parent().unwrap_or(&root).join(&target_name);
+        let unchanged = path_collision_key(source) == path_collision_key(&target);
+        entries.push(BatchRenameEntry {
+            source: user_facing_path(source),
+            target: user_facing_path(&target),
+            source_name,
+            target_name,
+            matched_folder: Some(matched_folder),
+            code: Some(code),
+            ready: !unchanged,
+            unchanged,
+            error: None,
+        });
+    }
+
+    let mut target_counts = BTreeMap::<String, usize>::new();
+    for entry in entries.iter().filter(|entry| entry.code.is_some()) {
+        *target_counts
+            .entry(path_collision_key(Path::new(&entry.target)))
+            .or_default() += 1;
+    }
+    for entry in &mut entries {
+        if entry.code.is_none() || entry.unchanged {
+            continue;
+        }
+        let target = Path::new(&entry.target);
+        let target_key = path_collision_key(target);
+        if target_counts.get(&target_key).copied().unwrap_or(0) > 1 {
+            entry.ready = false;
+            entry.error = Some("新文件名重复，请在模板中加入 {name} 或 {index}".to_string());
+        } else if target.exists() {
+            entry.ready = false;
+            entry.error = Some("目标文件已存在".to_string());
+        }
+    }
+
+    let matched = entries.iter().filter(|entry| entry.code.is_some()).count();
+    let failed = entries
+        .iter()
+        .filter(|entry| entry.code.is_some() && entry.error.is_some())
+        .count();
+    let skipped = entries
+        .len()
+        .saturating_sub(entries.iter().filter(|entry| entry.ready).count());
+    Ok(BatchRenameResult {
+        entries,
+        matched,
+        renamed: 0,
+        skipped,
+        failed,
+    })
+}
+
+fn temporary_rename_path(source: &Path, index: usize) -> PathBuf {
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    for attempt in 0..10_000 {
+        let candidate = parent.join(format!(
+            ".piclite-rename-{}-{}-{index}-{attempt}.tmp",
+            std::process::id(),
+            now_ms()
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!(
+        ".piclite-rename-{}-{index}.tmp",
+        std::process::id()
+    ))
+}
+
+#[tauri::command]
+async fn preview_batch_rename(request: BatchRenameRequest) -> Result<BatchRenameResult, String> {
+    build_batch_rename_plan(&request)
+}
+
+#[tauri::command]
+async fn apply_batch_rename(request: BatchRenameRequest) -> Result<BatchRenameResult, String> {
+    execute_batch_rename(&request)
+}
+
+// Publish without replacing a target, including one created after preview.
+fn move_without_overwrite(source: &Path, target: &Path) -> Result<(), std::io::Error> {
+    match fs::hard_link(source, target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+        Err(_) => {
+            // FAT/exFAT do not support hard links. Reserve the destination atomically.
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            let result = (|| {
+                let mut input = fs::File::open(source)?;
+                std::io::copy(&mut input, &mut output)?;
+                let metadata = input.metadata()?;
+                if let Ok(modified) = metadata.modified() {
+                    output.set_times(fs::FileTimes::new().set_modified(modified))?;
+                }
+                output.flush()
+            })();
+            if let Err(error) = result {
+                drop(output);
+                let _ = fs::remove_file(target);
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(target);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn copy_without_overwrite(source: &Path, target: &Path) -> Result<(), std::io::Error> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    let result = (|| {
+        let mut input = fs::File::open(source)?;
+        std::io::copy(&mut input, &mut output)?;
+        if let Ok(modified) = input.metadata()?.modified() {
+            output.set_times(fs::FileTimes::new().set_modified(modified))?;
+        }
+        output.flush()
+    })();
+    if let Err(error) = result {
+        drop(output);
+        let _ = fs::remove_file(target);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_converted_without_overwrite(
+    read_path: &Path,
+    original_path: &Path,
+    target: &Path,
+    request: &BatchRenameRequest,
+) -> Result<(), String> {
+    let original = fs::read(read_path).map_err(|error| error.to_string())?;
+    let source_extension = extension_for(original_path, "keep");
+    let settings = WatcherSettings {
+        profiles: Vec::new(),
+        folder_rename: None,
+        only_when_needed: false,
+        notify_on_complete: false,
+        show_floating_result: false,
+        input_folder: String::new(),
+        input_folders: Vec::new(),
+        output_folder: String::new(),
+        output_suffix: String::new(),
+        rename_template: String::new(),
+        mode: "manual".into(),
+        quality: request.quality.clamp(1, 100),
+        scale: 100.0,
+        format: request.output_format.clone(),
+        resize: false,
+        resize_mode: "shrink".to_string(),
+        max_width: u32::MAX,
+        max_height: u32::MAX,
+        strip_metadata: true,
+        prevent_larger: false,
+        target_size_kb: 0,
+    };
+    let converted = optimize_image_data(original, source_extension, &settings)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = output.write_all(&converted.bytes) {
+        drop(output);
+        let _ = fs::remove_file(target);
+        return Err(error.to_string());
+    }
+    if let Ok(modified) = fs::metadata(read_path).and_then(|metadata| metadata.modified()) {
+        let _ = output.set_times(fs::FileTimes::new().set_modified(modified));
+    }
+    Ok(())
+}
+
+fn execute_batch_rename(request: &BatchRenameRequest) -> Result<BatchRenameResult, String> {
+    let mut result = build_batch_rename_plan(&request)?;
+    let runnable = result
+        .entries
+        .iter()
+        .filter(|entry| entry.ready && !entry.unchanged)
+        .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
+        .collect::<Vec<_>>();
+    let convert = !request.output_format.is_empty() && request.output_format != "keep";
+
+    if request.preserve_original && !convert {
+        let mut completed = Vec::<PathBuf>::new();
+        for (source, target) in &runnable {
+            if let Err(error) = copy_without_overwrite(source, target) {
+                for path in completed.iter().rev() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(format!("无法复制到 {}：{error}", target.to_string_lossy()));
+            }
+            completed.push(target.clone());
+        }
+        result.renamed = completed.len();
+        result.skipped = result.entries.len().saturating_sub(result.renamed);
+        return Ok(result);
+    }
+
+    let mut staged = Vec::<(PathBuf, PathBuf, PathBuf)>::new();
+    if request.preserve_original && convert {
+        let attempts = runnable
+            .par_iter()
+            .map(|(source, target)| {
+                write_converted_without_overwrite(source, source, target, request)
+                    .map(|_| target.clone())
+                    .map_err(|error| format!("无法转换到 {}：{error}", target.to_string_lossy()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(error) = attempts.iter().find_map(|attempt| attempt.as_ref().err()) {
+            for path in attempts.iter().filter_map(|attempt| attempt.as_ref().ok()) {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error.clone());
+        }
+        result.renamed = attempts.len();
+        result.skipped = result.entries.len().saturating_sub(result.renamed);
+        return Ok(result);
+    }
+
+    for (index, (source, target)) in runnable.iter().enumerate() {
+        let temporary = temporary_rename_path(source, index);
+        if let Err(error) = move_without_overwrite(source, &temporary) {
+            for (original, _, staged_path) in staged.iter().rev() {
+                let _ = move_without_overwrite(staged_path, original);
+            }
+            return Err(format!("无法暂存 {}：{error}", source.to_string_lossy()));
+        }
+        staged.push((source.clone(), target.clone(), temporary));
+    }
+
+    if convert {
+        let attempts = staged
+            .par_iter()
+            .map(|(source, target, temporary)| {
+                write_converted_without_overwrite(temporary, source, target, request)
+                    .map(|_| target.clone())
+                    .map_err(|error| format!("无法转换到 {}：{error}", target.to_string_lossy()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(error) = attempts.iter().find_map(|attempt| attempt.as_ref().err()) {
+            for path in attempts.iter().filter_map(|attempt| attempt.as_ref().ok()) {
+                let _ = fs::remove_file(path);
+            }
+            for (remaining_source, _, remaining_temporary) in staged.iter().rev() {
+                if remaining_temporary.exists() {
+                    let _ = move_without_overwrite(remaining_temporary, remaining_source);
+                }
+            }
+            return Err(error.clone());
+        }
+        for (source, _, temporary) in &staged {
+            fs::remove_file(temporary)
+                .map_err(|error| format!("无法完成 {}：{error}", source.to_string_lossy()))?;
+        }
+        result.renamed = attempts.len();
+        result.skipped = result.entries.len().saturating_sub(result.renamed);
+        return Ok(result);
+    }
+
+    let mut completed = Vec::<(PathBuf, PathBuf)>::new();
+    for (index, (source, target, temporary)) in staged.iter().enumerate() {
+        if let Err(error) = move_without_overwrite(temporary, target) {
+            for (finished_source, finished_target) in completed.iter().rev() {
+                let _ = move_without_overwrite(finished_target, finished_source);
+            }
+            for (remaining_source, _, remaining_temporary) in staged.iter().skip(index) {
+                let _ = move_without_overwrite(remaining_temporary, remaining_source);
+            }
+            return Err(format!("无法写入 {}：{error}", target.to_string_lossy()));
+        }
+        completed.push((source.clone(), target.clone()));
+    }
+    result.renamed = completed.len();
+    result.skipped = result.entries.len().saturating_sub(result.renamed);
+    Ok(result)
+}
+
+fn mime_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
+        "qoi" => "image/qoi",
+        "tga" => "image/x-tga",
+        _ => "application/octet-stream",
+    }
+}
+
+fn extension_for(path: &Path, format: &str) -> String {
+    match format {
+        "image/jpeg" => "jpg".to_string(),
+        "image/jfif" => "jfif".to_string(),
+        "image/png" => "png".to_string(),
+        "image/webp" => "webp".to_string(),
+        "image/avif" => "avif".to_string(),
+        "image/gif" => "gif".to_string(),
+        "image/bmp" => "bmp".to_string(),
+        "image/tiff" => "tiff".to_string(),
+        "image/x-icon" => "ico".to_string(),
+        "image/qoi" => "qoi".to_string(),
+        "image/x-tga" => "tga".to_string(),
+        _ => path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase(),
+    }
+}
+
+fn safe_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if "<>:\"/\\|?*\0".contains(character) || character.is_control() {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+}
+
+/// Builds output names without teaching the native compressor about UI state.
+/// Templates intentionally stay small and filesystem-safe:
+/// `{name}`, `{suffix}`, `{date}`, `{time}`, `{datetime}`, `{size}`, `{width}`,
+/// `{height}` and `{ext}` are available. The extension is always added when a
+/// template does not include `{ext}` so users cannot accidentally create a
+/// result the OS no longer recognises as an image.
+fn render_output_name(
+    template: &str,
+    base: &str,
+    suffix: &str,
+    extension: &str,
+    bytes: usize,
+    width: u32,
+    height: u32,
+) -> String {
+    let now = Local::now();
+    let template = if template.trim().is_empty() {
+        "{name}{suffix}"
+    } else {
+        template.trim()
+    };
+    let mut value = template
+        .replace("{name}", base)
+        .replace("{suffix}", suffix)
+        .replace("{date}", &now.format("%Y-%m-%d").to_string())
+        .replace("{time}", &now.format("%H-%M-%S").to_string())
+        .replace("{datetime}", &now.format("%Y-%m-%d_%H-%M-%S").to_string())
+        .replace("{size}", &bytes.to_string())
+        .replace("{width}", &width.to_string())
+        .replace("{height}", &height.to_string())
+        .replace("{ext}", extension);
+    if !template.contains("{ext}") {
+        value = format!("{value}.{extension}");
+    }
+    safe_file_name(&value)
+}
+
+fn available_path(directory: &Path, requested_name: &str) -> Result<PathBuf, String> {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let safe = safe_file_name(requested_name);
+    let requested = Path::new(&safe);
+    let extension = requested
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let base = requested
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("piclite");
+    for index in 1..10_000 {
+        let name = if index == 1 || extension.is_empty() {
+            if index == 1 {
+                safe.clone()
+            } else {
+                format!("{base}-{index}")
+            }
+        } else {
+            format!("{base}-{index}.{extension}")
+        };
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("无法生成不冲突的文件名".to_string())
+}
+
+fn target_dimensions(width: u32, height: u32, settings: &WatcherSettings) -> (u32, u32) {
+    if settings.resize && settings.resize_mode == "exact" {
+        return (settings.max_width.max(1), settings.max_height.max(1));
+    }
+    if settings.resize && settings.resize_mode == "fit" {
+        let ratio = (settings.max_width.max(1) as f64 / width.max(1) as f64)
+            .min(settings.max_height.max(1) as f64 / height.max(1) as f64)
+            .clamp(0.001, 8.0);
+        return (
+            ((width as f64 * ratio).round() as u32).max(1),
+            ((height as f64 * ratio).round() as u32).max(1),
+        );
+    }
+    let mut ratio = (settings.scale / 100.0).clamp(0.001, 8.0);
+    if settings.resize {
+        ratio = ratio
+            .min(settings.max_width.max(1) as f64 / width.max(1) as f64)
+            .min(settings.max_height.max(1) as f64 / height.max(1) as f64);
+    }
+    (
+        ((width as f64 * ratio).round() as u32).max(1),
+        ((height as f64 * ratio).round() as u32).max(1),
+    )
+}
+
+fn resize_dynamic_fast(
+    image: DynamicImage,
+    width: u32,
+    height: u32,
+) -> Result<DynamicImage, String> {
+    if image.dimensions() == (width, height) {
+        return Ok(image);
+    }
+    let source_width = image.width();
+    let source_height = image.height();
+    let rgba = image.to_rgba8();
+    let source = FastImage::from_vec_u8(
+        source_width,
+        source_height,
+        rgba.into_raw(),
+        FastPixelType::U8x4,
+    )
+    .map_err(|error| format!("无法准备缩放像素：{error}"))?;
+    let mut destination = FastImage::new(width, height, FastPixelType::U8x4);
+    FastResizer::new()
+        .resize(&source, &mut destination, None)
+        .map_err(|error| format!("图片缩放失败：{error}"))?;
+    let output = image::RgbaImage::from_raw(width, height, destination.into_vec())
+        .ok_or_else(|| "无法创建缩放结果".to_string())?;
+    Ok(DynamicImage::ImageRgba8(output))
+}
+
+fn quantize_rgba(image: &mut image::RgbaImage, quality: u8) {
+    if quality >= 100 {
+        return;
+    }
+    let normalized = (quality.max(1) as f32 - 1.0) / 99.0;
+    let levels = (2.0 + 254.0 * normalized.powf(1.7))
+        .round()
+        .clamp(2.0, 256.0);
+    let step = 255.0 / (levels - 1.0);
+    for pixel in image.pixels_mut() {
+        for channel in &mut pixel.0[..3] {
+            *channel = ((*channel as f32 / step).round() * step).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn guarded_quality_steps(quality: u8) -> Vec<u8> {
+    let mut steps = Vec::new();
+    for offset in [4_u8, 8, 14, 22, 32, 44, 58, 72, 99] {
+        let candidate = quality.saturating_sub(offset).max(1);
+        if candidate < quality && !steps.contains(&candidate) {
+            steps.push(candidate);
+        }
+    }
+    steps
+}
+
+fn has_meaningful_savings(original: usize, candidate: usize) -> bool {
+    if candidate >= original {
+        return false;
+    }
+    let saved = original - candidate;
+    let minimum_bytes = if original < 32 * 1024 { 96 } else { 256 };
+    saved >= minimum_bytes && candidate.saturating_mul(100) <= original.saturating_mul(98)
+}
+
+fn encode_indexed_gif(original: &[u8], quality: u8) -> Result<Vec<u8>, String> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    let mut decoder = options
+        .read_info(Cursor::new(original))
+        .map_err(|e| e.to_string())?;
+    let global = decoder.global_palette().map(|p| p.to_vec());
+    let (width, height) = (decoder.width(), decoder.height());
+    let mut output = Vec::new();
+    {
+        let mut encoder =
+            gif::Encoder::new(&mut output, width, height, &[]).map_err(|e| e.to_string())?;
+        let mut first = true;
+        while let Some(frame) = decoder.read_next_frame().map_err(|e| e.to_string())? {
+            let mut frame = frame.clone();
+            if first {
+                encoder
+                    .set_repeat(decoder.repeat())
+                    .map_err(|e| e.to_string())?;
+                first = false;
+            }
+            let palette = frame
+                .palette
+                .as_ref()
+                .or(global.as_ref())
+                .ok_or("GIF 缺少调色板")?;
+            let levels = if quality >= 100 {
+                256
+            } else if quality >= 65 {
+                4
+            } else {
+                3
+            };
+            let mut colors: Vec<[u8; 3]> = Vec::new();
+            let mut remap = vec![0u8; palette.len() / 3];
+            // Reserve a distinct transparent index so opaque black stays opaque.
+            if frame.transparent.is_some() {
+                colors.push([0, 0, 0]);
+            }
+            for (i, color) in palette.chunks_exact(3).enumerate() {
+                if frame.transparent == Some(i as u8) {
+                    remap[i] = 0;
+                    continue;
+                }
+                let rgb = std::array::from_fn(|c| {
+                    let value = color[c] as u32;
+                    (((value * (levels - 1) + 127) / 255) * 255 / (levels - 1)) as u8
+                });
+                let skip = usize::from(frame.transparent.is_some());
+                let index = colors
+                    .iter()
+                    .enumerate()
+                    .skip(skip)
+                    .find(|(_, v)| **v == rgb)
+                    .map(|(i, _)| i)
+                    .unwrap_or_else(|| {
+                        colors.push(rgb);
+                        colors.len() - 1
+                    });
+                remap[i] = index as u8;
+            }
+            let indices = frame
+                .buffer
+                .iter()
+                .map(|v| remap[*v as usize])
+                .collect::<Vec<_>>();
+            frame.buffer = Cow::Owned(indices);
+            frame.palette = Some(colors.into_iter().flatten().collect());
+            frame.transparent = frame.transparent.map(|_| 0);
+            encoder.write_frame(&frame).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(output)
+}
+
+fn encode_gif(original: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+    let decoder =
+        GifDecoder::new(BufReader::new(Cursor::new(original))).map_err(|e| e.to_string())?;
+    if decoder.dimensions() == (width, height) {
+        return encode_indexed_gif(original, quality);
+    }
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    let mut metadata = options
+        .read_info(Cursor::new(original))
+        .map_err(|e| e.to_string())?;
+    metadata.next_frame_info().map_err(|e| e.to_string())?;
+    let repeat = metadata.repeat();
+    let mut encoded = Vec::new();
+    let mut previous: Option<image::RgbaImage> = None;
+    {
+        let mut encoder = gif::Encoder::new(&mut encoded, width as u16, height as u16, &[])
+            .map_err(|e| e.to_string())?;
+        encoder.set_repeat(repeat).map_err(|e| e.to_string())?;
+        for frame in decoder.into_frames() {
+            let frame = frame.map_err(|e| e.to_string())?;
+            let delay = frame.delay();
+            let mut pixels = frame.into_buffer();
+            if pixels.dimensions() != (width, height) {
+                pixels = image::imageops::resize(&pixels, width, height, FilterType::Triangle);
+            }
+            quantize_rgba(&mut pixels, quality);
+            let opaque = pixels.pixels().all(|p| p.0[3] == 255);
+            let mut bounds = (0, 0, width, height);
+            if opaque {
+                if let Some(old) = previous
+                    .as_ref()
+                    .filter(|v| v.pixels().all(|p| p.0[3] == 255))
+                {
+                    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+                    for y in 0..height {
+                        for x in 0..width {
+                            if pixels.get_pixel(x, y) != old.get_pixel(x, y) {
+                                left = left.min(x);
+                                top = top.min(y);
+                                right = right.max(x + 1);
+                                bottom = bottom.max(y + 1);
+                            }
+                        }
+                    }
+                    bounds = if right == 0 {
+                        (0, 0, 1, 1)
+                    } else {
+                        (left, top, right - left, bottom - top)
+                    };
+                }
+            }
+            let (left, top, w, h) = bounds;
+            let mut cropped = image::imageops::crop_imm(&pixels, left, top, w, h)
+                .to_image()
+                .into_raw();
+            // Fast NeuQuant sampling avoids expensive palette searches across
+            // every full screenshot frame. Encode only the changed rectangle.
+            let mut output = gif::Frame::from_rgba_speed(w as u16, h as u16, &mut cropped, 30);
+            output.left = left as u16;
+            output.top = top as u16;
+            output.delay = (gif_delay_ms(delay) / 10).max(1).min(u16::MAX as i32) as u16;
+            output.dispose = if opaque {
+                gif::DisposalMethod::Keep
+            } else {
+                gif::DisposalMethod::Background
+            };
+            encoder.write_frame(&output).map_err(|e| e.to_string())?;
+            previous = Some(pixels);
+        }
+    }
+    Ok(encoded)
+}
+
+fn gif_delay_ms(delay: image::Delay) -> i32 {
+    let (numerator, denominator) = delay.numer_denom_ms();
+    let denominator = denominator.max(1) as u64;
+    let rounded = (numerator as u64 + denominator / 2) / denominator;
+    rounded.clamp(10, i32::MAX as u64) as i32
+}
+
+fn is_animated_webp(data: &[u8]) -> bool {
+    if data.len() < 21 || &data[..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return false;
+    }
+    if &data[12..16] == b"VP8X" && data[20] & 0x02 != 0 {
+        return true;
+    }
+
+    let mut offset = 12_usize;
+    while offset.saturating_add(8) <= data.len() {
+        let chunk = &data[offset..offset + 4];
+        if chunk == b"ANIM" || chunk == b"ANMF" {
+            return true;
+        }
+        let size = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]) as usize;
+        let Some(next) = offset
+            .checked_add(8)
+            .and_then(|value| value.checked_add(size))
+            .and_then(|value| value.checked_add(size & 1))
+        else {
+            break;
+        };
+        if next <= offset || next > data.len() {
+            break;
+        }
+        offset = next;
+    }
+    false
+}
+
+struct DecodedWebPAnimation {
+    width: u32,
+    height: u32,
+    loop_count: i32,
+    background: [u8; 4],
+    frames: Vec<(image::RgbaImage, i32)>,
+}
+
+fn decode_webp_animation(original: &[u8]) -> Result<DecodedWebPAnimation, String> {
+    let decoded = AnimatedWebPDecoder::new(original)
+        .decode()
+        .map_err(|error| format!("动态 WebP 解码失败：{error}"))?;
+    if !decoded.has_animation() {
+        return Err("WebP 不包含多个动画帧".to_string());
+    }
+    let loop_count = decoded.loop_count.min(i32::MAX as u32) as i32;
+    let background = [
+        decoded.bg_color as u8,
+        (decoded.bg_color >> 8) as u8,
+        (decoded.bg_color >> 16) as u8,
+        (decoded.bg_color >> 24) as u8,
+    ];
+    let mut frames = Vec::with_capacity(decoded.len());
+    for frame in &decoded {
+        let image =
+            image::RgbaImage::from_raw(frame.width(), frame.height(), frame.get_image().to_vec())
+                .ok_or_else(|| "动态 WebP 帧像素数据无效".to_string())?;
+        frames.push((image, frame.get_time_ms()));
+    }
+    let (width, height) = frames
+        .first()
+        .map(|(frame, _)| frame.dimensions())
+        .ok_or_else(|| "WebP 不包含可编码的动画帧".to_string())?;
+    Ok(DecodedWebPAnimation {
+        width,
+        height,
+        loop_count,
+        background,
+        frames,
+    })
+}
+
+fn encode_rgba_webp_animation(
+    frames: &[(Vec<u8>, i32)],
+    width: u32,
+    height: u32,
+    quality: u8,
+    loop_count: i32,
+    background: [u8; 4],
+) -> Result<Vec<u8>, String> {
+    let mut config = WebPConfig::new().map_err(|_| "无法初始化动态 WebP 编码器".to_string())?;
+    let lossless = quality >= 100;
+    config.lossless = i32::from(lossless);
+    // In libwebp's lossless mode, `quality` controls compression effort rather
+    // than pixel fidelity. 100 spends much longer searching for a smaller file
+    // without improving the image. A medium effort remains pixel-lossless and
+    // keeps interactive animation watermark previews practical.
+    config.quality = if lossless {
+        75.0
+    } else {
+        quality.clamp(1, 99) as f32
+    };
+    config.alpha_quality = quality.clamp(35, 100) as i32;
+    config.method = if lossless { 3 } else { 4 };
+    config.thread_level = 1;
+    let mut encoder = AnimatedWebPEncoder::new(width, height, &config);
+    encoder.set_bgcolor(background);
+    encoder.set_loop_count(loop_count.max(0));
+    for (pixels, frame_timestamp) in frames {
+        encoder.add_frame(AnimatedWebPFrame::from_rgba(
+            pixels,
+            width,
+            height,
+            *frame_timestamp,
+        ));
+    }
+    let encoded = encoder
+        .try_encode()
+        .map_err(|error| format!("动态 WebP 编码失败：{error:?}"))?;
+    Ok(encoded.to_vec())
+}
+
+fn animation_end_sentinel(total_duration: i32, frame_count: usize, last_start: i32) -> i32 {
+    let count = frame_count.max(1) as i64;
+    let compensated = ((total_duration.max(10) as i64 * count) + count / 2) / (count + 1);
+    (compensated as i32)
+        .max(last_start.saturating_add(10))
+        .min(total_duration.max(last_start.saturating_add(10)))
+}
+
+fn encode_animated_webp(
+    original: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    let decoder = GifDecoder::new(BufReader::new(Cursor::new(original)))
+        .map_err(|error| error.to_string())?;
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|error| error.to_string())?;
+    if frames.is_empty() {
+        return Err("GIF 不包含可编码的动画帧".to_string());
+    }
+
+    let mut timestamp = 0_i32;
+    let mut encoded_frames = Vec::with_capacity(frames.len() + 1);
+    for frame in frames {
+        let delay = gif_delay_ms(frame.delay());
+        let mut buffer = frame.into_buffer();
+        if buffer.width() != width || buffer.height() != height {
+            buffer = image::imageops::resize(&buffer, width, height, FilterType::Lanczos3);
+        }
+        encoded_frames.push((buffer.into_raw(), timestamp));
+        timestamp = timestamp.saturating_add(delay);
+    }
+    // The webp crate finalises animations with a zero timestamp, so libwebp
+    // estimates one trailing interval. A duplicate last frame at the compensated
+    // timestamp keeps the intended total duration without adding a visible frame.
+    if let Some((last, last_start)) = encoded_frames.last() {
+        let sentinel = animation_end_sentinel(timestamp, encoded_frames.len(), *last_start);
+        encoded_frames.push((last.clone(), sentinel));
+    }
+
+    encode_rgba_webp_animation(&encoded_frames, width, height, quality, 0, [0, 0, 0, 0])
+}
+
+fn encode_decoded_webp_animation(
+    animation: &DecodedWebPAnimation,
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    encode_decoded_webp_animation_with_watermark(animation, width, height, quality, None)
+}
+
+enum PreparedAnimationWatermark {
+    Visible(image::RgbaImage),
+    Blind { bits: Vec<i8>, strength: i16 },
+}
+
+fn prepare_animation_watermark(
+    watermark: &NativeAnimationWatermark,
+    width: u32,
+    height: u32,
+) -> Result<PreparedAnimationWatermark, String> {
+    if watermark.kind == "blind" {
+        let payload = format!("PicLite:{}", watermark.text.trim());
+        if watermark.text.trim().is_empty() {
+            return Err("盲水印内容不能为空".to_string());
+        }
+        let bits = payload
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| (0..8).map(move |bit| if byte >> (7 - bit) & 1 == 1 { 1 } else { -1 }))
+            .collect::<Vec<_>>();
+        return Ok(PreparedAnimationWatermark::Blind {
+            bits,
+            strength: watermark.blind_strength.clamp(1, 8) as i16,
+        });
+    }
+
+    let bytes = BASE64
+        .decode(watermark.data.as_bytes())
+        .map_err(|error| format!("动图水印无法解码：{error}"))?;
+    let source = image::load_from_memory(&bytes)
+        .map_err(|error| format!("动图水印无法读取：{error}"))?
+        .to_rgba8();
+    let mut overlay = if source.dimensions() == (width, height) {
+        source
+    } else {
+        image::imageops::resize(&source, width, height, FilterType::Lanczos3)
+    };
+    let opacity = watermark.opacity.clamp(1, 100) as u16;
+    for pixel in overlay.pixels_mut() {
+        pixel.0[3] = ((pixel.0[3] as u16 * opacity) / 100) as u8;
+    }
+    Ok(PreparedAnimationWatermark::Visible(overlay))
+}
+
+fn apply_animation_watermark(frame: &mut image::RgbaImage, watermark: &PreparedAnimationWatermark) {
+    match watermark {
+        PreparedAnimationWatermark::Visible(overlay) => {
+            image::imageops::overlay(frame, overlay, 0, 0);
+        }
+        PreparedAnimationWatermark::Blind { bits, strength } => {
+            if bits.is_empty() {
+                return;
+            }
+            let block = 8_u32;
+            let blocks_across = frame.width().div_ceil(block).max(1);
+            let samples = [(1_u32, 1_u32, 1_i16), (2, 1, -1), (5, 5, 1), (6, 5, -1)];
+            for y in (0..frame.height()).step_by(block as usize) {
+                for x in (0..frame.width()).step_by(block as usize) {
+                    let bit_index = ((y / block) * blocks_across + x / block) as usize % bits.len();
+                    let bit = bits[bit_index] as i16;
+                    for (dx, dy, carrier) in samples {
+                        let px = x + dx;
+                        let py = y + dy;
+                        if px >= frame.width() || py >= frame.height() {
+                            continue;
+                        }
+                        let pixel = frame.get_pixel_mut(px, py);
+                        let delta = bit * carrier * *strength;
+                        for channel in &mut pixel.0[..3] {
+                            *channel = (*channel as i16 + delta).clamp(0, 255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn encode_decoded_webp_animation_with_watermark(
+    animation: &DecodedWebPAnimation,
+    width: u32,
+    height: u32,
+    quality: u8,
+    watermark: Option<&PreparedAnimationWatermark>,
+) -> Result<Vec<u8>, String> {
+    let mut encoded_frames = Vec::with_capacity(animation.frames.len() + 1);
+    let mut start_timestamp = 0_i32;
+    for (frame, end_timestamp) in &animation.frames {
+        let mut buffer = if frame.width() != width || frame.height() != height {
+            image::imageops::resize(frame, width, height, FilterType::Lanczos3)
+        } else {
+            frame.clone()
+        };
+        if let Some(watermark) = watermark {
+            apply_animation_watermark(&mut buffer, watermark);
+        }
+        encoded_frames.push((buffer.into_raw(), start_timestamp));
+        start_timestamp = (*end_timestamp).max(start_timestamp.saturating_add(10));
+    }
+    if let Some((last, last_start)) = encoded_frames.last() {
+        let sentinel = animation_end_sentinel(start_timestamp, encoded_frames.len(), *last_start);
+        encoded_frames.push((last.clone(), sentinel));
+    }
+    encode_rgba_webp_animation(
+        &encoded_frames,
+        width,
+        height,
+        quality,
+        animation.loop_count,
+        animation.background,
+    )
+}
+
+fn encode_animated_webp_with_watermark(
+    original: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    watermark: &PreparedAnimationWatermark,
+) -> Result<Vec<u8>, String> {
+    let decoder = GifDecoder::new(BufReader::new(Cursor::new(original)))
+        .map_err(|error| error.to_string())?;
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|error| error.to_string())?;
+    if frames.is_empty() {
+        return Err("GIF 不包含可编码的动画帧".to_string());
+    }
+
+    let mut timestamp = 0_i32;
+    let mut encoded_frames = Vec::with_capacity(frames.len() + 1);
+    for frame in frames {
+        let delay = gif_delay_ms(frame.delay());
+        let mut buffer = frame.into_buffer();
+        if buffer.width() != width || buffer.height() != height {
+            buffer = image::imageops::resize(&buffer, width, height, FilterType::Lanczos3);
+        }
+        apply_animation_watermark(&mut buffer, watermark);
+        encoded_frames.push((buffer.into_raw(), timestamp));
+        timestamp = timestamp.saturating_add(delay);
+    }
+    if let Some((last, last_start)) = encoded_frames.last() {
+        let sentinel = animation_end_sentinel(timestamp, encoded_frames.len(), *last_start);
+        encoded_frames.push((last.clone(), sentinel));
+    }
+    encode_rgba_webp_animation(&encoded_frames, width, height, quality, 0, [0, 0, 0, 0])
+}
+
+fn encode_gif_with_watermark(
+    original: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    watermark: &PreparedAnimationWatermark,
+) -> Result<Vec<u8>, String> {
+    let decoder = GifDecoder::new(BufReader::new(Cursor::new(original)))
+        .map_err(|error| error.to_string())?;
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|error| error.to_string())?;
+    let mut encoded = Vec::new();
+    {
+        let speed = (31_u8.saturating_sub((quality as u16 * 30 / 100) as u8)).clamp(1, 30) as i32;
+        let mut encoder = GifEncoder::new_with_speed(&mut encoded, speed);
+        encoder
+            .set_repeat(Repeat::Infinite)
+            .map_err(|error| error.to_string())?;
+        for frame in frames {
+            let delay = frame.delay();
+            let mut buffer = frame.into_buffer();
+            if buffer.width() != width || buffer.height() != height {
+                buffer = image::imageops::resize(&buffer, width, height, FilterType::Lanczos3);
+            }
+            apply_animation_watermark(&mut buffer, watermark);
+            quantize_rgba(&mut buffer, quality);
+            encoder
+                .encode_frame(Frame::from_parts(buffer, 0, 0, delay))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(encoded)
+}
+
+fn animation_quality(settings: &WatcherSettings) -> u8 {
+    match settings.mode.as_str() {
+        "lossless" => 100,
+        "balanced" => settings.quality.clamp(78, 88),
+        "small" => settings.quality.clamp(1, 58),
+        _ => settings.quality.clamp(1, 100),
+    }
+}
+
+fn optimize_webp_animation(
+    original: &[u8],
+    settings: &WatcherSettings,
+) -> Result<OptimizedImage, String> {
+    if !matches!(settings.format.as_str(), "keep" | "image/webp") {
+        return Err("动态 WebP 只能保持 WebP 格式，不能转换为静态图片格式".to_string());
+    }
+    let animation = decode_webp_animation(original)?;
+    let (target_width, target_height) =
+        target_dimensions(animation.width, animation.height, settings);
+    if settings.mode == "lossless"
+        && settings.format == "keep"
+        && target_width == animation.width
+        && target_height == animation.height
+    {
+        return Ok(OptimizedImage {
+            bytes: original.to_vec(),
+            extension: "webp".to_string(),
+        });
+    }
+
+    let quality = animation_quality(settings);
+    let candidate =
+        encode_decoded_webp_animation(&animation, target_width, target_height, quality)?;
+    let resized = target_width != animation.width || target_height != animation.height;
+    // Re-encoding every frame through a quality ladder is disproportionately
+    // expensive. One animation encode is enough; the guard restores the source
+    // only when no resize was explicitly requested.
+    if settings.prevent_larger
+        && !resized
+        && !has_meaningful_savings(original.len(), candidate.len())
+    {
+        return Ok(OptimizedImage {
+            bytes: original.to_vec(),
+            extension: "webp".to_string(),
+        });
+    }
+    Ok(OptimizedImage {
+        bytes: candidate,
+        extension: "webp".to_string(),
+    })
+}
+
+fn optimize_gif_animation(
+    original: &[u8],
+    settings: &WatcherSettings,
+) -> Result<OptimizedImage, String> {
+    let decoder = GifDecoder::new(BufReader::new(Cursor::new(original)))
+        .map_err(|error| error.to_string())?;
+    let (width, height) = decoder.dimensions();
+    let (target_width, target_height) = target_dimensions(width, height, settings);
+
+    // Lossless GIF optimisation keeps indexed colors and local frame geometry.
+    if settings.mode == "lossless"
+        && settings.format == "keep"
+        && target_width == width
+        && target_height == height
+    {
+        let candidate = encode_indexed_gif(original, 100)?;
+        return Ok(OptimizedImage {
+            bytes: if candidate.len() < original.len() {
+                candidate
+            } else {
+                original.to_vec()
+            },
+            extension: "gif".to_string(),
+        });
+    }
+
+    if settings.format == "image/webp" {
+        return Ok(OptimizedImage {
+            bytes: encode_animated_webp(original, target_width, target_height, settings.quality)?,
+            extension: "webp".to_string(),
+        });
+    }
+
+    if settings.format == "keep" && matches!(settings.mode.as_str(), "auto" | "balanced" | "small")
+    {
+        let quality = if matches!(settings.mode.as_str(), "auto" | "balanced") {
+            settings.quality.clamp(78, 88)
+        } else {
+            settings.quality.min(58).max(1)
+        };
+        let gif = encode_gif(original, target_width, target_height, quality)?;
+        if has_meaningful_savings(original.len(), gif.len()) {
+            return Ok(OptimizedImage {
+                bytes: gif,
+                extension: "gif".to_string(),
+            });
+        }
+        let webp = encode_animated_webp(original, target_width, target_height, quality)?;
+        let mut best = if webp.len() < gif.len() {
+            OptimizedImage {
+                bytes: webp,
+                extension: "webp".to_string(),
+            }
+        } else {
+            OptimizedImage {
+                bytes: gif,
+                extension: "gif".to_string(),
+            }
+        };
+        if settings.prevent_larger && !has_meaningful_savings(original.len(), best.bytes.len()) {
+            best = OptimizedImage {
+                bytes: original.to_vec(),
+                extension: "gif".to_string(),
+            };
+        }
+        return Ok(best);
+    }
+
+    let candidate = encode_gif(original, target_width, target_height, settings.quality)?;
+    let visual_transform = target_width != width || target_height != height;
+    if settings.prevent_larger && candidate.len() >= original.len() {
+        if visual_transform {
+            for quality in guarded_quality_steps(settings.quality) {
+                let guarded = encode_gif(original, target_width, target_height, quality)?;
+                if guarded.len() < original.len() {
+                    return Ok(OptimizedImage {
+                        bytes: guarded,
+                        extension: "gif".to_string(),
+                    });
+                }
+            }
+        }
+        return Ok(OptimizedImage {
+            bytes: original.to_vec(),
+            extension: "gif".to_string(),
+        });
+    }
+    Ok(OptimizedImage {
+        bytes: candidate,
+        extension: "gif".to_string(),
+    })
+}
+
+fn encode_static_ref(
+    image: &DynamicImage,
+    output_extension: &str,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    let mut encoded = Vec::new();
+    match output_extension {
+        "jpg" | "jpeg" | "jfif" => {
+            let rgb = image.to_rgb8();
+            JpegEncoder::new_with_quality(&mut encoded, quality.max(1))
+                .encode(
+                    &rgb,
+                    rgb.width(),
+                    rgb.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        "png" => {
+            let rgba = image.to_rgba8();
+            if quality >= 100 {
+                // 100% is the explicit true-colour, pixel-lossless PNG mode.
+                PngEncoder::new_with_quality(
+                    &mut encoded,
+                    CompressionType::Best,
+                    PngFilterType::Adaptive,
+                )
+                .write_image(
+                    &rgba,
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                // PNG has no standard "quality" field. Use an indexed palette
+                // below 100%, matching common PNG optimisers while retaining
+                // per-entry alpha instead of silently ignoring the slider.
+                let normalized = (quality.clamp(1, 99) as f32 / 100.0).clamp(0.01, 0.99);
+                let colors = (64.0 + 192.0 * normalized.powf(1.35))
+                    .round()
+                    .clamp(64.0, 256.0) as usize;
+                let quantizer = color_quant::NeuQuant::new(10, colors, rgba.as_raw());
+                let color_map = quantizer.color_map_rgba();
+                let mut indices = Vec::with_capacity((rgba.width() * rgba.height()) as usize);
+                for pixel in rgba.pixels() {
+                    // Per-pixel noise made flat artwork much harder for
+                    // DEFLATE to compress. Direct palette mapping is faster,
+                    // keeps flat colours stable, and produces smaller PNGs.
+                    indices.push(quantizer.index_of(&pixel.0) as u8);
+                }
+                let mut palette = Vec::with_capacity(colors * 3);
+                let mut transparency = Vec::with_capacity(colors);
+                for color in color_map.chunks_exact(4) {
+                    palette.extend_from_slice(&color[..3]);
+                    transparency.push(color[3]);
+                }
+                while transparency.last() == Some(&u8::MAX) {
+                    transparency.pop();
+                }
+                let mut encoder = png::Encoder::new(&mut encoded, rgba.width(), rgba.height());
+                encoder.set_color(png::ColorType::Indexed);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder.set_palette(palette);
+                if !transparency.is_empty() {
+                    encoder.set_trns(transparency);
+                }
+                encoder
+                    .write_header()
+                    .map_err(|error| error.to_string())?
+                    .write_image_data(&indices)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        "webp" => {
+            // libwebp rejects zero-sized and >16383px edges. Its convenience
+            // Encoder::encode unwraps these errors and aborts a release process,
+            // including tray-only background jobs on both macOS and Windows.
+            if image.width() == 0 || image.height() == 0 || image.width() > 16383 || image.height() > 16383 {
+                return Err("WebP 每条边必须为 1–16383 像素，请缩小尺寸或选择 PNG/JPEG".into());
+            }
+            let rgba = image.to_rgba8();
+            if quality >= 100 {
+                WebPEncoder::new_lossless(&mut encoded)
+                    .write_image(
+                        &rgba,
+                        rgba.width(),
+                        rgba.height(),
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else {
+                // Below 100%, use libwebp so the quality slider changes the real
+                // encoded output. The 100% path above is genuinely pixel-lossless.
+                let mut config = WebPConfig::new().map_err(|_| "无法初始化 WebP 编码器".to_string())?;
+                config.quality = quality.clamp(1, 99) as f32;
+                let webp = LossyWebPEncoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                    .encode_advanced(&config)
+                    .map_err(|error| format!("WebP 编码失败：{error:?}"))?;
+                encoded.extend_from_slice(webp.as_ref());
+            }
+        }
+        "avif" => {
+            let rgba = image.to_rgba8();
+            AvifEncoder::new_with_speed_quality(&mut encoded, 8, quality.clamp(1, 100))
+                .with_num_threads(Some(2))
+                .write_image(
+                    &rgba,
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        "gif" | "bmp" | "tif" | "tiff" | "ico" | "qoi" | "tga" => {
+            let format = match output_extension {
+                "gif" => image::ImageFormat::Gif,
+                "bmp" => image::ImageFormat::Bmp,
+                "tif" | "tiff" => image::ImageFormat::Tiff,
+                "ico" => image::ImageFormat::Ico,
+                "qoi" => image::ImageFormat::Qoi,
+                "tga" => image::ImageFormat::Tga,
+                _ => unreachable!(),
+            };
+            let mut cursor = Cursor::new(Vec::new());
+            if output_extension == "ico" {
+                let ico_image = if image.width() > 256 || image.height() > 256 {
+                    image.resize(256, 256, FilterType::Lanczos3)
+                } else {
+                    image.clone()
+                };
+                DynamicImage::ImageRgba8(ico_image.to_rgba8())
+                    .write_to(&mut cursor, format)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                image
+                    .write_to(&mut cursor, format)
+                    .map_err(|error| error.to_string())?;
+            }
+            encoded = cursor.into_inner();
+        }
+        _ => return Err(format!("自动监测暂不支持编码 .{output_extension}")),
+    }
+    Ok(encoded)
+}
+
+fn encode_static(
+    image: DynamicImage,
+    output_extension: &str,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    encode_static_ref(&image, output_extension, quality)
+}
+
+#[derive(Clone)]
+struct OptimizedImage {
+    bytes: Vec<u8>,
+    extension: String,
+}
+
+/// Read encoded dimensions without a second full pixel decode after encoding.
+fn encoded_dimensions(data: &[u8]) -> Result<(u32, u32), String> {
+    if heic_input::is_heic(data) {
+        return heic_input::dimensions(data);
+    }
+    image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())
+}
+
+/// Apply embedded orientation exactly once, matching the browser preview.
+fn decode_static_oriented(data: &[u8]) -> Result<DynamicImage, String> {
+    if heic_input::is_heic(data) {
+        return heic_input::decode(data);
+    }
+    let reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|error| error.to_string())?;
+    let orientation = decoder.orientation().map_err(|error| error.to_string())?;
+    let mut decoded = DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
+    decoded.apply_orientation(orientation);
+    Ok(decoded)
+}
+
+fn rotate_watermark(source: &image::RgbaImage, degrees: f64) -> image::RgbaImage {
+    let normalized = degrees.rem_euclid(360.0);
+    if normalized.abs() < 0.01 || (normalized - 360.0).abs() < 0.01 {
+        return source.clone();
+    }
+    let radians = normalized.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let width = source.width() as f64;
+    let height = source.height() as f64;
+    let output_width = (width * cos.abs() + height * sin.abs()).ceil().max(1.0) as u32;
+    let output_height = (width * sin.abs() + height * cos.abs()).ceil().max(1.0) as u32;
+    let mut output = image::RgbaImage::new(output_width, output_height);
+    let source_center = ((width - 1.0) / 2.0, (height - 1.0) / 2.0);
+    let output_center = (
+        (output_width as f64 - 1.0) / 2.0,
+        (output_height as f64 - 1.0) / 2.0,
+    );
+    for y in 0..output_height {
+        for x in 0..output_width {
+            let dx = x as f64 - output_center.0;
+            let dy = y as f64 - output_center.1;
+            let source_x = cos * dx + sin * dy + source_center.0;
+            let source_y = -sin * dx + cos * dy + source_center.1;
+            if source_x >= 0.0 && source_x < width && source_y >= 0.0 && source_y < height {
+                output.put_pixel(
+                    x,
+                    y,
+                    *source.get_pixel(
+                        (source_x.round() as u32).min(source.width() - 1),
+                        (source_y.round() as u32).min(source.height() - 1),
+                    ),
+                );
+            }
+        }
+    }
+    output
+}
+
+fn apply_native_image_watermark(
+    image: DynamicImage,
+    watermark: &NativeImageWatermark,
+) -> Result<DynamicImage, String> {
+    let watermark_bytes = BASE64
+        .decode(watermark.data.as_bytes())
+        .map_err(|error| format!("图片水印无法解码：{error}"))?;
+    let source = image::load_from_memory(&watermark_bytes)
+        .map_err(|error| format!("图片水印无法读取：{error}"))?;
+    let mut base = image.to_rgba8();
+    let max_side = ((base.width().min(base.height()) as f64)
+        * (watermark.image_scale / 100.0).clamp(0.02, 0.6))
+    .round()
+    .max(1.0) as u32;
+    let ratio = max_side as f64 / source.width().max(source.height()).max(1) as f64;
+    let mark_width = ((source.width() as f64 * ratio).round() as u32).max(1);
+    let mark_height = ((source.height() as f64 * ratio).round() as u32).max(1);
+    let resized = source
+        .resize_exact(mark_width, mark_height, FilterType::Lanczos3)
+        .to_rgba8();
+    let mut mark = rotate_watermark(&resized, watermark.rotation);
+    let opacity = watermark.opacity.clamp(1, 100) as u16;
+    for pixel in mark.pixels_mut() {
+        pixel.0[3] = ((pixel.0[3] as u16 * opacity) / 100) as u8;
+    }
+
+    if watermark.layout == "tile" {
+        let density = (watermark.density / 100.0).clamp(0.0, 1.0);
+        let sparse = (1.0 - density).powi(2);
+        let step_x = (mark.width() as f64 + mark.height() as f64 * (1.05 + sparse * 18.0))
+            .round()
+            .max(1.0) as u32;
+        let step_y = (mark.height() as f64 * (1.45 + sparse * 14.0))
+            .round()
+            .max(1.0) as u32;
+        let mut row = 0_u32;
+        let mut y = 0_u32;
+        while y < base.height() {
+            let mut x = if row % 2 == 1 { step_x / 2 } else { 0 };
+            while x < base.width() {
+                image::imageops::overlay(&mut base, &mark, x as i64, y as i64);
+                x = x.saturating_add(step_x);
+            }
+            row += 1;
+            y = y.saturating_add(step_y);
+        }
+    } else {
+        let center_x = base.width() as f64 * (watermark.position_x / 100.0).clamp(0.0, 1.0);
+        let center_y = base.height() as f64 * (watermark.position_y / 100.0).clamp(0.0, 1.0);
+        let x = (center_x - mark.width() as f64 / 2.0).round() as i64;
+        let y = (center_y - mark.height() as f64 / 2.0).round() as i64;
+        image::imageops::overlay(&mut base, &mark, x, y);
+    }
+    Ok(DynamicImage::ImageRgba8(base))
+}
+
+fn optimize_image_data_unconstrained(
+    original: Vec<u8>,
+    source_extension: String,
+    settings: &WatcherSettings,
+) -> Result<OptimizedImage, String> {
+    if source_extension == "gif"
+        && matches!(
+            settings.format.as_str(),
+            "keep" | "image/webp" | "image/gif"
+        )
+    {
+        return optimize_gif_animation(&original, settings);
+    }
+    if source_extension == "webp" && is_animated_webp(&original) {
+        return optimize_webp_animation(&original, settings);
+    }
+
+    let decoded = decode_static_oriented(&original)?;
+    let (width, height) = decoded.dimensions();
+    if matches!(
+        settings.mode.as_str(),
+        "auto" | "lossless" | "balanced" | "small"
+    ) {
+        // The original "super compression" behaviour came from measuring real
+        // JPEG, WebP and PNG encodes, rather than blindly re-encoding the source
+        // container. Keep that useful behaviour while decoding and resizing only
+        // once, then run the independent encoders in parallel.
+        let quality = match settings.mode.as_str() {
+            "auto" => settings.quality.clamp(78, 90),
+            // "Lossless priority" is a perceptual high-quality preset. A strict
+            // pixel-lossless re-encode commonly saves 0 bytes and is not useful
+            // as the product's first compression option.
+            "lossless" => settings.quality.clamp(88, 92),
+            "balanced" => settings.quality.clamp(72, 82),
+            "small" => settings.quality.clamp(1, 48),
+            _ => unreachable!(),
+        };
+        let (target_width, target_height) = target_dimensions(width, height, settings);
+        let resized = resize_dynamic_fast(decoded, target_width, target_height)?;
+
+        if settings.format != "keep" {
+            let output_extension = extension_for(Path::new("image.png"), &settings.format);
+            // An explicitly requested lossless format remains truly lossless.
+            // The high-quality cross-format preset above applies only to AUTO.
+            let explicit_quality = if settings.mode == "lossless" {
+                100
+            } else {
+                quality
+            };
+            let candidate = encode_static_ref(&resized, &output_extension, explicit_quality)?;
+            let resized_pixels = target_width != width || target_height != height;
+            if settings.prevent_larger && !resized_pixels && candidate.len() >= original.len() {
+                return Ok(OptimizedImage {
+                    bytes: original,
+                    extension: source_extension,
+                });
+            }
+            return Ok(OptimizedImage {
+                bytes: candidate,
+                extension: output_extension,
+            });
+        }
+
+        let has_transparency = resized.color().has_alpha()
+            && resized.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255);
+        let source_format = match source_extension.as_str() {
+            "jpeg" | "jfif" => "jpg",
+            other => other,
+        };
+        let mut formats = Vec::with_capacity(3);
+        if matches!(source_format, "jpg" | "png" | "webp")
+            && !(has_transparency && source_format == "jpg")
+        {
+            formats.push(source_format);
+        }
+        for format in if has_transparency {
+            &["webp", "png"][..]
+        } else {
+            &["webp", "jpg", "png"][..]
+        } {
+            if !formats.contains(format) {
+                formats.push(format);
+            }
+        }
+
+        let pixel_count = u64::from(resized.width()) * u64::from(resized.height());
+        let best_size = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let encode_candidate = |extension: &str| -> Result<Option<OptimizedImage>, String> {
+            // PNG has no perceptual quality control. In the high-quality preset
+            // retain its true-colour pixels; WebP/JPEG still provide the useful
+            // visually-lossless size reduction users expect from this option.
+            let candidate_quality = if settings.mode == "lossless" && extension == "png" {
+                100
+            } else {
+                quality
+            };
+            if extension == "png" && (4_000_000..=24_000_000).contains(&pixel_count) {
+                if png_candidate::stream(&resized, candidate_quality, &best_size)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            let bytes = match encode_static_ref(&resized, extension, candidate_quality) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(None), // An optional format must not cancel all candidates.
+            };
+            best_size.fetch_min(bytes.len(), Ordering::Relaxed);
+            Ok(Some(OptimizedImage {
+                bytes,
+                extension: extension.to_string(),
+            }))
+        };
+        let candidates = if pixel_count <= 24_000_000 && formats.len() > 1 {
+            thread::scope(|scope| -> Result<Vec<Option<OptimizedImage>>, String> {
+                let handles = formats
+                    .iter()
+                    .map(|extension| scope.spawn(|| encode_candidate(extension)))
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| "智能优化编码线程异常退出".to_string())?
+                    })
+                    .collect()
+            })?
+        } else {
+            formats
+                .iter()
+                .map(|extension| encode_candidate(extension))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let best = candidates
+            .into_iter()
+            .flatten()
+            .min_by_key(|candidate| candidate.bytes.len())
+            .ok_or_else(|| "没有生成可用的智能优化结果".to_string())?;
+        let worthwhile = if settings.mode == "auto" {
+            has_meaningful_savings(original.len(), best.bytes.len())
+        } else {
+            best.bytes.len() < original.len()
+        };
+        let visual_transform = target_width != width || target_height != height;
+        if settings.prevent_larger && !worthwhile && !visual_transform {
+            return Ok(OptimizedImage {
+                bytes: original,
+                extension: source_extension,
+            });
+        }
+        return Ok(best);
+    }
+
+    let (target_width, target_height) = target_dimensions(width, height, settings);
+    let resized = resize_dynamic_fast(decoded, target_width, target_height)?;
+    let output_extension = if settings.format == "keep" {
+        if matches!(source_extension.as_str(), "heic" | "heif") {
+            "webp".to_string()
+        } else {
+            source_extension.clone()
+        }
+    } else {
+        extension_for(Path::new("image.png"), &settings.format)
+    };
+    let encode_quality = settings.quality;
+    let candidate = encode_static(resized.clone(), &output_extension, encode_quality)?;
+    let visual_transform = target_width != width || target_height != height;
+    if settings.prevent_larger && candidate.len() >= original.len() {
+        if visual_transform && settings.mode != "lossless" {
+            let mut smallest = candidate;
+            for quality in guarded_quality_steps(encode_quality) {
+                let guarded = encode_static(resized.clone(), &output_extension, quality)?;
+                if guarded.len() < smallest.len() {
+                    smallest = guarded.clone();
+                }
+                if guarded.len() < original.len() {
+                    return Ok(OptimizedImage {
+                        bytes: guarded,
+                        extension: output_extension,
+                    });
+                }
+            }
+            return Ok(OptimizedImage {
+                bytes: smallest,
+                extension: output_extension,
+            });
+        }
+        if visual_transform {
+            // A requested lossless resize/format change may legitimately be
+            // larger. Never satisfy the size guard by silently lowering quality.
+            return Ok(OptimizedImage {
+                bytes: candidate,
+                extension: output_extension,
+            });
+        }
+        return Ok(OptimizedImage {
+            bytes: original,
+            extension: source_extension,
+        });
+    }
+    Ok(OptimizedImage {
+        bytes: candidate,
+        extension: output_extension,
+    })
+}
+
+fn optimize_image_data(
+    original: Vec<u8>,
+    source_extension: String,
+    settings: &WatcherSettings,
+) -> Result<OptimizedImage, String> {
+    let is_animation =
+        source_extension == "gif" || (source_extension == "webp" && is_animated_webp(&original));
+    let animation_target = animation_size::target_bytes(settings);
+    if is_animation && animation_target > 0 {
+        return animation_size::optimize(&original, &source_extension, settings, animation_target);
+    }
+    let mut unconstrained = settings.clone();
+    unconstrained.target_size_kb = 0;
+    let initial = optimize_image_data_unconstrained(
+        original.clone(),
+        source_extension.clone(),
+        &unconstrained,
+    )?;
+    let target_bytes = usize::try_from(settings.target_size_kb)
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    if target_bytes == 0
+        || initial.bytes.len() <= target_bytes
+        || source_extension == "gif"
+        || (source_extension == "webp" && is_animated_webp(&original))
+    {
+        return Ok(initial);
+    }
+
+    // A size cap is an explicit request. Start from the user's dimensions,
+    // lower quality first, then reduce dimensions in small steps. Keep the
+    // closest candidate if an unusually detailed image cannot hit the cap.
+    let constrained_format = if settings.format == "keep" && settings.mode != "manual" {
+        Some(match initial.extension.as_str() {
+            "jpg" | "jpeg" | "jfif" => "image/jpeg",
+            "webp" => "image/webp",
+            "png" => "image/png",
+            _ => "keep",
+        })
+    } else {
+        None
+    };
+    let mut best = initial;
+    let mut scales = Vec::new();
+    for factor in [1.0, 0.78, 0.6, 0.46, 0.34, 0.25, 0.18, 0.12] {
+        let scale = (settings.scale * factor).clamp(0.1, 800.0);
+        if scales
+            .last()
+            .is_none_or(|previous: &f64| (previous - scale).abs() > 0.01)
+        {
+            scales.push(scale);
+        }
+    }
+    for scale in scales {
+        let encode_trial = |quality: u8| -> Result<OptimizedImage, String> {
+            let mut trial = unconstrained.clone();
+            trial.mode = "manual".into();
+            trial.prevent_larger = false;
+            trial.scale = scale;
+            trial.quality = quality;
+            if let Some(format) = constrained_format {
+                trial.format = format.into();
+            }
+            optimize_image_data_unconstrained(original.clone(), source_extension.clone(), &trial)
+        };
+        let minimum = encode_trial(8)?;
+        if minimum.bytes.len() < best.bytes.len() {
+            best = minimum.clone();
+        }
+        if minimum.bytes.len() > target_bytes {
+            continue;
+        }
+
+        // This scale can satisfy the cap. Binary-search the highest quality
+        // that still fits instead of encoding every quality step.
+        let mut chosen = minimum;
+        let mut low = 9_u8;
+        let mut high = settings.quality.clamp(9, 100);
+        while low <= high {
+            let quality = low + (high - low) / 2;
+            let candidate = encode_trial(quality)?;
+            if candidate.bytes.len() <= target_bytes {
+                chosen = candidate;
+                low = quality.saturating_add(1);
+            } else {
+                high = quality - 1;
+            }
+        }
+        return Ok(chosen);
+    }
+    Ok(best)
+}
+
+fn optimize_image(path: &Path, settings: &WatcherSettings) -> Result<OptimizedImage, String> {
+    let original = fs::read(path).map_err(|error| error.to_string())?;
+    let source_extension = extension_for(path, "keep");
+    optimize_image_data(original, source_extension, settings)
+}
+
+#[cfg(test)]
+fn optimize_bytes(path: &Path, settings: &WatcherSettings) -> Result<Vec<u8>, String> {
+    optimize_image(path, settings).map(|optimized| optimized.bytes)
+}
+
+fn native_images_from_paths(
+    paths: Vec<String>,
+    state: &DesktopState,
+) -> Result<Vec<NativeImage>, String> {
+    let mut images = Vec::new();
+    let mut authorized = state
+        .source_files
+        .lock()
+        .map_err(|_| "文件授权状态不可用".to_string())?;
+    for requested in paths {
+        let path = PathBuf::from(requested);
+        if !is_image(&path) || !path.is_file() {
+            continue;
+        }
+        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        let data = fs::read(&canonical).map_err(|error| error.to_string())?;
+        authorized.insert(canonical.clone());
+        let preview = heic_input::preview(&data)?;
+        images.push(NativeImage {
+            name: canonical
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+                .to_string(),
+            mime_type: mime_for(&canonical).to_string(),
+            path: canonical.to_string_lossy().to_string(),
+            data: BASE64.encode(data),
+            preview_data: preview.as_ref().map(|(data, _, _)| BASE64.encode(data)),
+            preview_type: preview.as_ref().map(|_| "image/png".to_string()),
+            width: preview.as_ref().map(|(_, w, _)| *w),
+            height: preview.as_ref().map(|(_, _, h)| *h),
+        });
+    }
+    Ok(images)
+}
+
+fn native_image_entries_from_paths_with_progress(
+    paths: Vec<PathBuf>,
+    state: &DesktopState,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<Vec<NativeImageEntry>, String> {
+    let total = paths.len();
+    on_progress(0, total);
+    let mut entries = Vec::new();
+    let mut authorized = state
+        .source_files
+        .lock()
+        .map_err(|_| "文件授权状态不可用".to_string())?;
+
+    for (index, requested) in paths.into_iter().enumerate() {
+        if !is_image(&requested) || !requested.is_file() {
+            on_progress(index + 1, total);
+            continue;
+        }
+        let canonical = fs::canonicalize(&requested).unwrap_or(requested);
+        let metadata = fs::metadata(&canonical).map_err(|error| error.to_string())?;
+        let (width, height) = if matches!(
+            canonical
+                .extension()
+                .and_then(|v| v.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str(),
+            "heic" | "heif"
+        ) {
+            heic_input::dimensions(&fs::read(&canonical).map_err(|e| e.to_string())?)?
+        } else {
+            let reader = image::ImageReader::open(&canonical)
+                .map_err(|error| error.to_string())?
+                .with_guessed_format()
+                .map_err(|error| error.to_string())?;
+            let mut decoder = reader.into_decoder().map_err(|error| error.to_string())?;
+            let orientation = decoder.orientation().map_err(|error| error.to_string())?;
+            let (raw_width, raw_height) = decoder.dimensions();
+            let swaps_axes = matches!(
+                orientation,
+                image::metadata::Orientation::Rotate90
+                    | image::metadata::Orientation::Rotate270
+                    | image::metadata::Orientation::Rotate90FlipH
+                    | image::metadata::Orientation::Rotate270FlipH
+            );
+            let (width, height) = if swaps_axes {
+                (raw_height, raw_width)
+            } else {
+                (raw_width, raw_height)
+            };
+
+            (width, height)
+        };
+
+        // Only decode thumbnails that can be visible in the initial queue.
+        // Hundreds of camera originals therefore remain path-backed and use
+        // only a few KiB each until the worker processes them.
+        let (thumbnail_type, thumbnail_data) = if index < 24 {
+            let original = fs::read(&canonical).map_err(|error| error.to_string())?;
+            let decoded = decode_static_oriented(&original)?;
+            let edge = if index == 0 { 1400 } else { 420 };
+            let thumbnail = decoded.thumbnail(edge, edge);
+            let bytes = encode_static(thumbnail, "webp", 74)?;
+            ("image/webp".to_string(), BASE64.encode(bytes))
+        } else {
+            (String::new(), String::new())
+        };
+
+        authorized.insert(canonical.clone());
+        entries.push(NativeImageEntry {
+            name: canonical
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+                .to_string(),
+            mime_type: mime_for(&canonical).to_string(),
+            path: canonical.to_string_lossy().to_string(),
+            original_bytes: metadata.len(),
+            width,
+            height,
+            thumbnail_type,
+            thumbnail_data,
+        });
+        on_progress(index + 1, total);
+    }
+    Ok(entries)
+}
+
+fn emit_image_import_progress(app: &AppHandle, current: usize, total: usize) {
+    let _ = app.emit(
+        "image-import:progress",
+        ImageImportProgress { current, total },
+    );
+}
+
+fn show_window(app: &AppHandle, label: &str) {
+    #[cfg(target_os = "macos")]
+    if label == "main"
+        && app
+            .state::<DesktopState>()
+            .show_in_taskbar_dock
+            .load(Ordering::Relaxed)
+    {
+        // Closing the main window moves PicLite back to accessory mode so its
+        // running icon leaves the Dock. Restore normal app activation only
+        // when the user explicitly opens the main window again.
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    }
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// The preferences webview used to be declared in `tauri.conf.json`, which
+/// made a complete renderer process live for the entire application lifetime
+/// even when settings had never been opened. Create it only on demand; closing
+/// it destroys the webview so its memory is returned to the OS.
+fn ensure_preferences_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("preferences") {
+        let _ = window.unminimize();
+        window.show().map_err(|error| error.to_string())?;
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        "preferences",
+        WebviewUrl::App("index.html?window=preferences".into()),
+    )
+    .title("PicLite 应用设置")
+    .inner_size(980.0, 700.0)
+    .min_inner_size(680.0, 500.0)
+    .resizable(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .build()
+    .map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
+fn open_preferences_from_menu(app: &AppHandle, action: Option<&'static str>) {
+    // Tauri/WebView2 warns against building a webview synchronously inside a
+    // menu callback on Windows, so perform the on-demand creation off-callback.
+    let app = app.clone();
+    thread::spawn(move || {
+        if ensure_preferences_window(&app).is_ok() {
+            if let Some(action) = action {
+                // The renderer installs its app-event listener during mount.
+                thread::sleep(Duration::from_millis(250));
+                let _ = app.emit("tray:action", action);
+            }
+        }
+    });
+}
+
+/// The floating result window is also created lazily. Keeping its transparent
+/// WKWebView alive from launch costs roughly another renderer process on macOS
+/// even when the user never opens the floating window.
+fn ensure_dropzone_window(app: &AppHandle) -> Result<bool, String> {
+    if app.get_webview_window("dropzone").is_some() {
+        return Ok(false);
+    }
+    WebviewWindowBuilder::new(
+        app,
+        "dropzone",
+        WebviewUrl::App("index.html?window=dropzone".into()),
+    )
+    .title("PicLite Results")
+    .inner_size(282.0, 202.0)
+    .min_inner_size(246.0, 188.0)
+    .resizable(true)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .content_protected(true)
+    .shadow(false)
+    .transparent(true)
+    .visible(false)
+    .build()
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn show_dropzone_ready(app: &AppHandle, state: &DesktopState) -> Result<bool, String> {
+    let created = ensure_dropzone_window(app)?;
+    ensure_dropzone_positioned(app, state);
+    show_window(app, "dropzone");
+    Ok(created)
+}
+
+fn open_dropzone_from_callback(app: &AppHandle, action: Option<&'static str>) {
+    let app = app.clone();
+    thread::spawn(move || {
+        let state = app.state::<DesktopState>();
+        let created = show_dropzone_ready(&app, &state).unwrap_or(false);
+        if let Some(action) = action {
+            if created {
+                thread::sleep(Duration::from_millis(250));
+            }
+            let _ = app.emit("tray:action", action);
+        }
+    });
+}
+
+fn position_dropzone(window: &tauri::WebviewWindow, logical_width: f64, logical_height: f64) {
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let margin = (18.0 * scale).round() as i32;
+    let width = (logical_width * scale).round() as i32;
+    let height = (logical_height * scale).round() as i32;
+    let position = monitor.position();
+    let size = monitor.size();
+    let corner = window
+        .state::<DesktopState>()
+        .floating_corner
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_else(|_| "bottom-right".to_string());
+    let x = if corner.ends_with("left") {
+        position.x + margin
+    } else {
+        position.x + size.width as i32 - width - margin
+    };
+    let y = if corner.starts_with("top") {
+        position.y + margin
+    } else {
+        position.y + size.height as i32 - height - margin
+    };
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+}
+
+fn resize_and_position_dropzone(app: &AppHandle, width: f64, height: f64) {
+    if let Some(window) = app.get_webview_window("dropzone") {
+        let width = width.clamp(190.0, 520.0);
+        let height = height.clamp(140.0, 420.0);
+        let _ = window.set_size(LogicalSize::new(width, height));
+        position_dropzone(&window, width, height);
+    }
+}
+
+fn keep_dropzone_on_screen(window: &tauri::WebviewWindow) {
+    let (Ok(position), Ok(size), Ok(Some(monitor))) = (
+        window.outer_position(),
+        window.outer_size(),
+        window.current_monitor(),
+    ) else {
+        return;
+    };
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let margin = (18.0 * monitor.scale_factor()).round() as i32;
+    let min_x = monitor_position.x + margin;
+    let min_y = monitor_position.y + margin;
+    let max_x = (monitor_position.x + monitor_size.width.saturating_sub(size.width) as i32
+        - margin)
+        .max(min_x);
+    let max_y = (monitor_position.y + monitor_size.height.saturating_sub(size.height) as i32
+        - margin)
+        .max(min_y);
+    let x = position.x.clamp(min_x, max_x);
+    let y = position.y.clamp(min_y, max_y);
+    if x != position.x || y != position.y {
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    }
+}
+
+fn configure_dropzone_dimensions(app: &AppHandle, state: &DesktopState, width: f64, height: f64) {
+    if state.floating_collapsed.load(Ordering::Relaxed) {
+        return;
+    }
+    let width = width.clamp(190.0, 520.0);
+    let height = height.clamp(140.0, 420.0);
+    if !state.dropzone_positioned.swap(true, Ordering::Relaxed) {
+        resize_and_position_dropzone(app, width, height);
+    } else if let Some(window) = app.get_webview_window("dropzone") {
+        // A user-selected position is durable for the current session. Resizing
+        // the window must not snap it back to the lower-right corner.
+        let _ = window.set_size(LogicalSize::new(width, height));
+        keep_dropzone_on_screen(&window);
+    }
+}
+
+fn ensure_dropzone_positioned(app: &AppHandle, state: &DesktopState) {
+    if state.dropzone_positioned.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("dropzone") {
+        if let (Ok(size), Ok(Some(monitor))) = (window.outer_size(), window.current_monitor()) {
+            let logical = size.to_logical::<f64>(monitor.scale_factor());
+            position_dropzone(&window, logical.width, logical.height);
+        }
+    }
+}
+
+fn resize_dropzone_around_center(app: &AppHandle, width: f64, height: f64) {
+    if app
+        .state::<DesktopState>()
+        .floating_collapsed
+        .load(Ordering::Relaxed)
+    {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("dropzone") {
+        let width = width.clamp(190.0, 520.0);
+        let height = height.clamp(140.0, 420.0);
+        let old_position = window.outer_position().ok();
+        let old_size = window.outer_size().ok();
+        let scale = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| monitor.scale_factor())
+            .unwrap_or(1.0);
+        let _ = window.set_size(LogicalSize::new(width, height));
+        if let (Some(position), Some(size)) = (old_position, old_size) {
+            let new_width = (width * scale).round() as i32;
+            let new_height = (height * scale).round() as i32;
+            let x = position.x + (size.width as i32 - new_width) / 2;
+            let y = position.y + (size.height as i32 - new_height) / 2;
+            let _ = window.set_position(PhysicalPosition::new(x, y));
+        }
+        keep_dropzone_on_screen(&window);
+    }
+}
+
+fn quick_settings(value: &QuickCompressSettings) -> WatcherSettings {
+    let inferred_mode = if value.quality >= 96 {
+        "lossless"
+    } else if value.quality >= 65 {
+        "balanced"
+    } else {
+        "small"
+    };
+    let mode = match value.mode.as_str() {
+        "auto" | "balanced" | "small" | "lossless" | "manual" => value.mode.clone(),
+        _ => inferred_mode.to_string(),
+    };
+    WatcherSettings {
+        profiles: Vec::new(),
+        folder_rename: None,
+        only_when_needed: false,
+        notify_on_complete: true,
+        show_floating_result: false,
+        input_folder: String::new(),
+        input_folders: Vec::new(),
+        output_folder: String::new(),
+        output_suffix: value.export_suffix.clone(),
+        rename_template: value.rename_template.clone(),
+        quality: value.quality.clamp(1, 100),
+        mode,
+        scale: value.scale.clamp(0.1, 800.0),
+        format: value.format.clone(),
+        resize: value.resize,
+        resize_mode: value.resize_mode.clone(),
+        max_width: if value.max_width == 0 {
+            u32::MAX
+        } else {
+            value.max_width
+        },
+        max_height: if value.max_height == 0 {
+            u32::MAX
+        } else {
+            value.max_height
+        },
+        strip_metadata: value.strip_metadata,
+        prevent_larger: value.prevent_larger,
+        target_size_kb: value.target_size_kb,
+    }
+}
+
+#[tauri::command]
+async fn read_images_from_paths(
+    paths: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<NativeImage>, String> {
+    native_images_from_paths(paths, &state)
+}
+
+#[tauri::command]
+async fn read_image_entries_from_paths(
+    paths: Vec<String>,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<NativeImageEntry>, String> {
+    native_image_entries_from_paths_with_progress(
+        paths.into_iter().map(PathBuf::from).collect(),
+        &state,
+        |current, total| emit_image_import_progress(&app, current, total),
+    )
+}
+
+#[tauri::command]
+async fn quick_compress_paths(
+    paths: Vec<String>,
+    settings: QuickCompressSettings,
+) -> Result<Vec<QuickCompressResult>, String> {
+    let compression = quick_settings(&settings);
+    let results = paths
+        .into_par_iter()
+        .map(|requested| {
+            let source = PathBuf::from(&requested);
+            let result = (|| -> Result<(PathBuf, u64, u64, u32, u32, bool), String> {
+                if !source.is_file() || !is_image(&source) {
+                    return Err("不是支持的图片文件".to_string());
+                }
+                let source = fs::canonicalize(&source).unwrap_or(source.clone());
+                let original_bytes = fs::metadata(&source)
+                    .map_err(|error| error.to_string())?
+                    .len();
+                let optimized = optimize_image(&source, &compression)?;
+                let output_extension = optimized.extension;
+                let base = source
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("image");
+                let suffix = if settings.export_suffix.trim().is_empty() {
+                    "-piclite"
+                } else {
+                    settings.export_suffix.trim()
+                };
+                let output_directory = if settings.export_mode == "fixed-folder" {
+                    settings
+                        .fixed_folder
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "固定输出文件夹尚未设置".to_string())?
+                } else {
+                    source
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .ok_or_else(|| "无法定位源文件夹".to_string())?
+                };
+                // 悬浮压缩坞始终生成新文件，避免一次拖放意外覆盖源图。
+                let (width, height) = encoded_dimensions(&optimized.bytes)
+                    .or_else(|_| image::image_dimensions(&source))
+                    .unwrap_or((0, 0));
+                let output_name = render_output_name(
+                    &settings.rename_template,
+                    base,
+                    suffix,
+                    &output_extension,
+                    optimized.bytes.len(),
+                    width,
+                    height,
+                );
+                let output = {
+                    let _guard = QUICK_OUTPUT_LOCK
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let output = available_path(&output_directory, &output_name)?;
+                    fs::write(&output, &optimized.bytes).map_err(|error| error.to_string())?;
+                    record_optimised_output(&output_directory, &output)?;
+                    output
+                };
+                Ok((
+                    output,
+                    original_bytes,
+                    optimized.bytes.len() as u64,
+                    width,
+                    height,
+                    optimized.bytes.len() as u64 == original_bytes,
+                ))
+            })();
+            match result {
+                Ok((output, original_bytes, output_bytes, width, height, kept_original)) => {
+                    QuickCompressResult {
+                        source: requested,
+                        output: Some(output.to_string_lossy().to_string()),
+                        original_bytes: Some(original_bytes),
+                        output_bytes: Some(output_bytes),
+                        width: Some(width),
+                        height: Some(height),
+                        kept_original,
+                        error: None,
+                    }
+                }
+                Err(error) => QuickCompressResult {
+                    source: requested,
+                    output: None,
+                    original_bytes: None,
+                    output_bytes: None,
+                    width: None,
+                    height: None,
+                    kept_original: false,
+                    error: Some(error),
+                },
+            }
+        })
+        .collect();
+    Ok(results)
+}
+
+#[tauri::command]
+async fn compress_animation_data(
+    data: Vec<u8>,
+    file_name: String,
+    settings: QuickCompressSettings,
+) -> Result<CompressedAnimationData, String> {
+    if data.is_empty() || data.len() > 256 * 1024 * 1024 {
+        return Err("动画图片为空或超过 256 MB".to_string());
+    }
+    let extension = Path::new(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let compression = quick_settings(&settings);
+    let _source_dimensions = match extension.as_str() {
+        "gif" => GifDecoder::new(BufReader::new(Cursor::new(&data)))
+            .map_err(|error| error.to_string())?
+            .dimensions(),
+        "webp" if is_animated_webp(&data) => image::ImageReader::new(Cursor::new(&data))
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?
+            .into_dimensions()
+            .map_err(|e| e.to_string())?,
+        "webp" => return Err("该 WebP 不包含多个动画帧".to_string()),
+        _ => return Err("当前原生动画编码仅接受 GIF 或动态 WebP".to_string()),
+    };
+    let optimized = optimize_image_data(data.clone(), extension.clone(), &compression)?;
+    let (width, height) = image::ImageReader::new(Cursor::new(&optimized.bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())?;
+    let mime_type = if optimized.extension == "webp" {
+        "image/webp"
+    } else {
+        "image/gif"
+    };
+    Ok(CompressedAnimationData {
+        kept_original: optimized.extension == extension && optimized.bytes == data,
+        data: BASE64.encode(optimized.bytes),
+        mime_type: mime_type.to_string(),
+        extension: optimized.extension,
+        width,
+        height,
+    })
+}
+
+fn compress_animation_with_watermark_data(
+    data: Vec<u8>,
+    file_name: String,
+    settings: QuickCompressSettings,
+    watermark: NativeAnimationWatermark,
+) -> Result<CompressedAnimationData, String> {
+    if data.is_empty() || data.len() > 256 * 1024 * 1024 {
+        return Err("动画图片为空或超过 256 MB".to_string());
+    }
+    let extension = Path::new(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let compression = quick_settings(&settings);
+    let quality = animation_quality(&compression);
+
+    let (encoded, width, height, output_extension) = match extension.as_str() {
+        "webp" if is_animated_webp(&data) => {
+            if !matches!(compression.format.as_str(), "keep" | "image/webp") {
+                return Err("动态 WebP 添加水印后只能输出 WebP".to_string());
+            }
+            let animation = decode_webp_animation(&data)?;
+            let (width, height) =
+                target_dimensions(animation.width, animation.height, &compression);
+            let prepared = prepare_animation_watermark(&watermark, width, height)?;
+            let encoded = encode_decoded_webp_animation_with_watermark(
+                &animation,
+                width,
+                height,
+                quality,
+                Some(&prepared),
+            )?;
+            (encoded, width, height, "webp")
+        }
+        "webp" => return Err("该 WebP 不包含多个动画帧".to_string()),
+        "gif" => {
+            if !matches!(compression.format.as_str(), "keep" | "image/webp") {
+                return Err("GIF 添加水印后只能输出 GIF 或 WebP".to_string());
+            }
+            let decoder = GifDecoder::new(BufReader::new(Cursor::new(&data)))
+                .map_err(|error| error.to_string())?;
+            let (source_width, source_height) = decoder.dimensions();
+            let (width, height) = target_dimensions(source_width, source_height, &compression);
+            let prepared = prepare_animation_watermark(&watermark, width, height)?;
+            if compression.format == "image/webp" {
+                let encoded =
+                    encode_animated_webp_with_watermark(&data, width, height, quality, &prepared)?;
+                (encoded, width, height, "webp")
+            } else {
+                let encoded = encode_gif_with_watermark(&data, width, height, quality, &prepared)?;
+                (encoded, width, height, "gif")
+            }
+        }
+        _ => return Err("当前原生动图水印仅接受 GIF 或动态 WebP".to_string()),
+    };
+
+    Ok(CompressedAnimationData {
+        data: BASE64.encode(encoded),
+        mime_type: if output_extension == "webp" {
+            "image/webp"
+        } else {
+            "image/gif"
+        }
+        .to_string(),
+        extension: output_extension.to_string(),
+        width,
+        height,
+        kept_original: false,
+    })
+}
+
+#[tauri::command]
+async fn compress_image_data(
+    data: Vec<u8>,
+    file_name: String,
+    settings: QuickCompressSettings,
+) -> Result<CompressedAnimationData, String> {
+    if data.is_empty() || data.len() > 256 * 1024 * 1024 {
+        return Err("图片为空或超过 256 MB".to_string());
+    }
+    let named_extension = Path::new(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let source_extension = match named_extension.as_str() {
+        "jpg" | "jpeg" | "jfif" => "jpg".to_string(),
+        "png" | "webp" | "gif" | "heic" | "heif" => named_extension,
+        _ => match image::guess_format(&data).map_err(|error| error.to_string())? {
+            image::ImageFormat::Jpeg => "jpg".to_string(),
+            image::ImageFormat::Png => "png".to_string(),
+            image::ImageFormat::WebP => "webp".to_string(),
+            image::ImageFormat::Gif => "gif".to_string(),
+            _ => return Err("当前原生编码不支持该图片格式".to_string()),
+        },
+    };
+    let compression = quick_settings(&settings);
+    let optimized = optimize_image_data(data.clone(), source_extension.clone(), &compression)?;
+    let (width, height) = encoded_dimensions(&optimized.bytes).unwrap_or_else(|_| {
+        encoded_dimensions(&data)
+            .map(|(w, h)| target_dimensions(w, h, &compression))
+            .unwrap_or((0, 0))
+    });
+    let mime_type = match optimized.extension.as_str() {
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        _ => "application/octet-stream",
+    };
+    let kept_original = optimized.extension == source_extension && optimized.bytes == data;
+    Ok(CompressedAnimationData {
+        data: BASE64.encode(optimized.bytes),
+        mime_type: mime_type.to_string(),
+        extension: optimized.extension,
+        width,
+        height,
+        kept_original,
+    })
+}
+
+#[tauri::command]
+async fn compress_image_base64(
+    data: String,
+    file_name: String,
+    settings: QuickCompressSettings,
+) -> Result<CompressedAnimationData, String> {
+    let decoded = BASE64
+        .decode(data.as_bytes())
+        .map_err(|error| format!("图片数据无法解码：{error}"))?;
+    compress_image_data(decoded, file_name, settings).await
+}
+
+#[tauri::command]
+async fn compress_image_with_watermark_base64(
+    data: String,
+    file_name: String,
+    settings: QuickCompressSettings,
+    watermark: NativeImageWatermark,
+) -> Result<CompressedAnimationData, String> {
+    let original = BASE64
+        .decode(data.as_bytes())
+        .map_err(|error| format!("图片数据无法解码：{error}"))?;
+    if original.is_empty() || original.len() > 256 * 1024 * 1024 {
+        return Err("图片为空或超过 256 MB".to_string());
+    }
+    let named_extension = Path::new(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let source_extension = match named_extension.as_str() {
+        "jpg" | "jpeg" | "jfif" => "jpg".to_string(),
+        "png" | "webp" | "heic" | "heif" => named_extension,
+        _ => match image::guess_format(&original).map_err(|error| error.to_string())? {
+            image::ImageFormat::Jpeg => "jpg".to_string(),
+            image::ImageFormat::Png => "png".to_string(),
+            image::ImageFormat::WebP => "webp".to_string(),
+            _ => return Err("图片水印暂不支持该原图格式".to_string()),
+        },
+    };
+    if source_extension == "webp" && is_animated_webp(&original) {
+        return Err("动态 WebP 暂不支持图片水印；已停止处理以避免动画被压成静态图".to_string());
+    }
+    let compression = quick_settings(&settings);
+    let decoded = decode_static_oriented(&original)?;
+    let (source_width, source_height) = decoded.dimensions();
+    let (width, height) = target_dimensions(source_width, source_height, &compression);
+    let resized = resize_dynamic_fast(decoded, width, height)?;
+    let watermarked = apply_native_image_watermark(resized, &watermark)?;
+    let extension = if compression.format == "keep" {
+        if matches!(source_extension.as_str(), "heic" | "heif") {
+            "webp".into()
+        } else {
+            source_extension
+        }
+    } else {
+        extension_for(Path::new("image.png"), &compression.format)
+    };
+    let quality = if compression.mode == "lossless" {
+        100
+    } else {
+        compression.quality
+    };
+    let encoded = encode_static(watermarked, &extension, quality)?;
+    let mime_type = match extension.as_str() {
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    };
+    Ok(CompressedAnimationData {
+        data: BASE64.encode(encoded),
+        mime_type: mime_type.to_string(),
+        extension,
+        width,
+        height,
+        kept_original: false,
+    })
+}
+
+#[tauri::command]
+async fn compress_animation_base64(
+    data: String,
+    file_name: String,
+    settings: QuickCompressSettings,
+) -> Result<CompressedAnimationData, String> {
+    let decoded = BASE64
+        .decode(data.as_bytes())
+        .map_err(|error| format!("动画数据无法解码：{error}"))?;
+    compress_animation_data(decoded, file_name, settings).await
+}
+
+#[tauri::command]
+async fn compress_animation_with_watermark_base64(
+    data: String,
+    file_name: String,
+    settings: QuickCompressSettings,
+    watermark: NativeAnimationWatermark,
+) -> Result<CompressedAnimationData, String> {
+    let decoded = BASE64
+        .decode(data.as_bytes())
+        .map_err(|error| format!("动画数据无法解码：{error}"))?;
+    compress_animation_with_watermark_data(decoded, file_name, settings, watermark)
+}
+
+#[tauri::command]
+async fn update_desktop_preferences(
+    preferences: NativeDesktopPreferences,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    state
+        .minimize_to_tray
+        .store(preferences.minimize_to_tray, Ordering::Relaxed);
+    state
+        .show_in_taskbar_dock
+        .store(preferences.show_in_taskbar_dock, Ordering::Relaxed);
+    state
+        .clipboard_monitor_enabled
+        .store(preferences.clipboard_watcher_enabled, Ordering::Relaxed);
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .set_skip_taskbar(!preferences.show_in_taskbar_dock)
+            .map_err(|error| error.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // "Show in Dock" applies while the main window is open. The red
+        // close button deliberately returns PicLite to menu-bar-only mode;
+        // receiving a later preferences sync must not put the closed app back
+        // in the Dock.
+        let main_is_visible = app
+            .get_webview_window("main")
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        app.set_activation_policy(if preferences.show_in_taskbar_dock && main_is_visible {
+            tauri::ActivationPolicy::Regular
+        } else {
+            tauri::ActivationPolicy::Accessory
+        })
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn configure_global_shortcuts(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    bindings: ShortcutBindings,
+) -> Result<(), String> {
+    let _guard = state
+        .shortcut_config_lock
+        .lock()
+        .map_err(|_| "快捷键配置状态不可用".to_string())?;
+    let shortcuts = app.global_shortcut();
+    shortcuts
+        .unregister_all()
+        .map_err(|error| error.to_string())?;
+    if !bindings.enabled {
+        return Ok(());
+    }
+
+    let mut configured = HashSet::new();
+    let entries = [
+        (
+            bindings.toggle_dropzone.trim().to_string(),
+            "toggle_dropzone",
+        ),
+        (
+            bindings.optimise_clipboard.trim().to_string(),
+            "optimise_clipboard",
+        ),
+        (bindings.show_main.trim().to_string(), "show_main"),
+        (bindings.show_gallery.trim().to_string(), "show_gallery"),
+        (bindings.upload_current.trim().to_string(), "upload_current"),
+    ];
+    for (shortcut, action) in entries {
+        if shortcut.is_empty() || !configured.insert(shortcut.clone()) {
+            continue;
+        }
+        shortcuts
+            .on_shortcut(shortcut.as_str(), move |app, _, event| {
+                if event.state != ShortcutState::Pressed {
+                    return;
+                }
+                match action {
+                    "toggle_dropzone" => {
+                        if let Some(window) = app.get_webview_window("dropzone") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let state = app.state::<DesktopState>();
+                                ensure_dropzone_positioned(app, &state);
+                                show_window(app, "dropzone");
+                            }
+                        } else {
+                            open_dropzone_from_callback(app, None);
+                        }
+                    }
+                    "optimise_clipboard" => {
+                        open_dropzone_from_callback(app, Some("optimise_clipboard"));
+                    }
+                    "show_main" => show_window(app, "main"),
+                    "show_gallery" => {
+                        show_window(app, "main");
+                        let _ = app.emit("tray:action", "gallery");
+                    }
+                    "upload_current" => {
+                        open_dropzone_from_callback(app, Some("upload_current"));
+                    }
+                    _ => {}
+                }
+            })
+            .map_err(|error| format!("快捷键 {shortcut} 注册失败：{error}"))?;
+    }
+    Ok(())
+}
+
+fn cleanup_marked_files(
+    directory: &Path,
+    suffix: &str,
+    cutoff: SystemTime,
+    deleted: &mut u64,
+) -> Result<(), String> {
+    let manifest = directory.join(".piclite-generated.txt");
+    let mut registered = if manifest.is_file() {
+        fs::read_to_string(&manifest)
+            .unwrap_or_default()
+            .lines()
+            .map(PathBuf::from)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            cleanup_marked_files(&path, suffix, cutoff, deleted)?;
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !is_image(&path) || (!stem.contains(suffix) && !registered.contains(&canonical)) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::now());
+        if modified <= cutoff && fs::remove_file(&path).is_ok() {
+            *deleted += 1;
+            registered.remove(&canonical);
+        }
+    }
+    registered.retain(|path| path.is_file());
+    if manifest.is_file() || !registered.is_empty() {
+        let contents = registered
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            &manifest,
+            if contents.is_empty() {
+                contents
+            } else {
+                format!("{contents}\n")
+            },
+        )
+        .map_err(|error| format!("无法更新 PicLite 清理记录：{error}"))?;
+    }
+    Ok(())
+}
+
+static GENERATED_MANIFEST_LOCK: Mutex<()> = Mutex::new(());
+static QUICK_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+
+fn record_optimised_output(directory: &Path, output: &Path) -> Result<(), String> {
+    let _guard = GENERATED_MANIFEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let canonical = fs::canonicalize(output).unwrap_or_else(|_| output.to_path_buf());
+    let manifest = directory.join(".piclite-generated.txt");
+    let existing = fs::read_to_string(&manifest).unwrap_or_default();
+    if existing.lines().any(|line| Path::new(line) == canonical) {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&manifest)
+        .map_err(|error| format!("无法记录 PicLite 输出文件：{error}"))?;
+    writeln!(file, "{}", canonical.to_string_lossy())
+        .map_err(|error| format!("无法记录 PicLite 输出文件：{error}"))
+}
+
+#[tauri::command]
+async fn cleanup_optimised_files(request: CleanupRequest) -> Result<CleanupResult, String> {
+    let suffix = request.suffix.trim();
+    if suffix.len() < 3 {
+        return Err("为避免误删，定期清理要求文件名后缀至少包含 3 个字符".to_string());
+    }
+    let directory = fs::canonicalize(PathBuf::from(request.folder.trim()))
+        .map_err(|_| "清理目录不存在或无法访问".to_string())?;
+    if !directory.is_dir() {
+        return Err("清理目标不是文件夹".to_string());
+    }
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(request.older_than_seconds.max(60)))
+        .unwrap_or(UNIX_EPOCH);
+    let mut deleted = 0;
+    cleanup_marked_files(&directory, suffix, cutoff, &mut deleted)?;
+    Ok(CleanupResult { deleted })
+}
+
+#[tauri::command]
+async fn show_main_window(app: AppHandle) -> Result<(), String> {
+    show_window(&app, "main");
+    Ok(())
+}
+
+#[tauri::command]
+async fn show_gallery_window(app: AppHandle) -> Result<(), String> {
+    app.emit("tray:action", "gallery")
+        .map_err(|error| error.to_string())?;
+    show_window(&app, "main");
+    Ok(())
+}
+
+#[tauri::command]
+async fn submit_corner_drop(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let valid = paths
+        .into_iter()
+        .filter(|path| {
+            let path = Path::new(path);
+            path.is_file() && is_image(path)
+        })
+        .collect::<Vec<_>>();
+    if valid.is_empty() {
+        return Err("拖放内容中没有支持的图片".to_string());
+    }
+    *state
+        .pending_corner_drop
+        .lock()
+        .map_err(|_| "拖放队列不可用".to_string())? = valid;
+    let created = show_dropzone_ready(&app, &state)?;
+    if created {
+        thread::sleep(Duration::from_millis(250));
+    }
+    app.emit("corner:drop", ())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn take_pending_corner_drop(state: State<'_, DesktopState>) -> Result<Vec<String>, String> {
+    let mut pending = state
+        .pending_corner_drop
+        .lock()
+        .map_err(|_| "拖放队列不可用".to_string())?;
+    Ok(std::mem::take(&mut *pending))
+}
+
+#[tauri::command]
+async fn take_pending_clipboard(
+    state: State<'_, DesktopState>,
+) -> Result<Option<PendingClipboard>, String> {
+    Ok(state
+        .pending_clipboard
+        .lock()
+        .map_err(|_| "剪贴板待处理状态不可用".to_string())?
+        .take())
+}
+
+#[tauri::command]
+async fn show_preferences_window(app: AppHandle, section: Option<String>) -> Result<(), String> {
+    ensure_preferences_window(&app)?;
+    if let Some(section) = section.filter(|value| {
+        matches!(
+            value.as_str(),
+            "general"
+                | "clipboard"
+                | "files"
+                | "images"
+                | "dropzone"
+                | "zones"
+                | "floating"
+                | "hosting"
+                | "plugins"
+                | "shortcuts"
+                | "about"
+                | "sponsor"
+        )
+    }) {
+        let _ = app.emit("tray:action", format!("preferences_section:{section}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn show_dropzone_window(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    show_dropzone_ready(&app, &state)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn configure_floating_behavior(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    corner: String,
+    click_through: bool,
+) -> Result<(), String> {
+    if !matches!(
+        corner.as_str(),
+        "top-left" | "top-right" | "bottom-left" | "bottom-right"
+    ) {
+        return Err("无效的屏幕位置".to_string());
+    }
+    let changed = {
+        let mut saved = state.floating_corner.lock().map_err(|e| e.to_string())?;
+        let changed = *saved != corner;
+        *saved = corner;
+        changed
+    };
+    state
+        .floating_click_through
+        .store(click_through, Ordering::Relaxed);
+    if let Some(window) = app.get_webview_window("dropzone") {
+        click_through::apply(&window, &state)?;
+        if changed {
+            if let (Ok(size), Ok(Some(monitor))) = (window.outer_size(), window.current_monitor()) {
+                let logical = size.to_logical::<f64>(monitor.scale_factor());
+                position_dropzone(&window, logical.width, logical.height);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_floating_toggle_region(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopState>,
+    region: Option<click_through::ToggleRegion>,
+    control: Option<String>,
+) -> Result<(), String> {
+    let control = control.unwrap_or_else(|| "click-through".into());
+    if window.label() != "dropzone"
+        || region.as_ref().is_some_and(|r| !r.valid())
+        || !matches!(control.as_str(), "click-through" | "collapse")
+    {
+        return Err("无效的穿透开关区域".into());
+    }
+    {
+        let mut regions = state
+            .floating_toggle_regions
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if let Some(region) = region {
+            regions.insert(control, region);
+        } else {
+            regions.remove(&control);
+        }
+    }
+    click_through::apply(&window, &state)
+}
+
+#[tauri::command]
+async fn set_floating_collapsed(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopState>,
+    collapsed: bool,
+) -> Result<(), String> {
+    floating_collapse::set(&window, &state, collapsed)
+}
+
+#[tauri::command]
+fn get_floating_collapsed(state: State<'_, DesktopState>) -> bool {
+    state.floating_collapsed.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+async fn move_floating_icon(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopState>,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<(), String> {
+    if window.label() != "dropzone"
+        || !state.floating_collapsed.load(Ordering::Relaxed)
+        || !delta_x.is_finite()
+        || !delta_y.is_finite()
+        || delta_x.abs() > 8192.0
+        || delta_y.abs() > 8192.0
+    {
+        return Err("无效的悬浮图标移动操作".into());
+    }
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    window
+        .set_position(PhysicalPosition::new(
+            position.x.saturating_add((delta_x * scale).round() as i32),
+            position.y.saturating_add((delta_y * scale).round() as i32),
+        ))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn configure_dropzone_window(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    configure_dropzone_dimensions(&app, &state, width, height);
+    Ok(())
+}
+
+#[tauri::command]
+async fn resize_dropzone_window(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
+    resize_dropzone_around_center(&app, width, height);
+    Ok(())
+}
+
+#[tauri::command]
+async fn hide_current_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn quit_application(app: AppHandle, state: State<'_, DesktopState>) -> Result<(), String> {
+    state.quitting.store(true, Ordering::Relaxed);
+    app.exit(0);
+    Ok(())
+}
+
+fn write_watched_output(directory: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    for _ in 0..10_000 {
+        let path = available_path(directory, name)?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                // Register the reserved path before writing so generated images never re-enter the queue.
+                let result = record_optimised_output(directory, &path)
+                    .and_then(|_| file.write_all(bytes).map_err(|e| e.to_string()));
+                if let Err(error) = result {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("无法生成不冲突的文件名".into())
+}
+
+fn process_watched_file(
+    app: AppHandle,
+    path: PathBuf,
+    settings: WatcherSettings,
+    processing: Arc<Mutex<HashSet<PathBuf>>>,
+) {
+    let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
+    {
+        let mut active = processing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(canonical.clone()) {
+            return;
+        }
+    }
+    let result = (|| -> Result<Option<(PathBuf, u64, u64)>, String> {
+        // Wait for the producer to finish copying rather than decoding a partial image.
+        let mut stable = 0;
+        let mut previous = None;
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(250));
+            let metadata = fs::metadata(&canonical).map_err(|e| e.to_string())?;
+            let signature = (metadata.len(), metadata.modified().ok());
+            if previous == Some(signature) && metadata.len() > 0 {
+                stable += 1;
+            } else {
+                stable = 0;
+            }
+            previous = Some(signature);
+            if stable >= 3 {
+                break;
+            }
+        }
+        if stable < 3 {
+            return Err("图片仍在写入，请完成复制后重试".to_string());
+        }
+        if registered_output(&canonical) || !watched_file_needs_processing(&canonical, &settings)? {
+            return Ok(None);
+        }
+        let metadata = fs::metadata(&canonical).map_err(|error| error.to_string())?;
+        let original_bytes = metadata.len();
+        let output_directory = if settings.output_folder == "@same-folder" {
+            canonical
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "无法定位源文件夹".to_string())?
+        } else if settings.output_folder.is_empty() {
+            PathBuf::from(&settings.input_folder).join("PicLite")
+        } else {
+            PathBuf::from(&settings.output_folder)
+        };
+        let optimized = optimize_image(&canonical, &settings)?;
+        let extension = optimized.extension;
+        let (width, height) = encoded_dimensions(&optimized.bytes)
+            .or_else(|_| image::image_dimensions(&canonical))
+            .unwrap_or((0, 0));
+        let output_name = watched_output_name(
+            &canonical,
+            &settings,
+            &extension,
+            optimized.bytes.len(),
+            width,
+            height,
+        )?;
+        let output_path = write_watched_output(&output_directory, &output_name, &optimized.bytes)?;
+        Ok(Some((
+            output_path,
+            original_bytes,
+            optimized.bytes.len() as u64,
+        )))
+    })();
+
+    match result {
+        Ok(None) => {}
+        Ok(Some((output_path, original_bytes, output_bytes))) => {
+            if settings.notify_on_complete {
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("PicLite · 图片处理完成")
+                    .body(format!(
+                        "{} → {} · {} KB → {} KB",
+                        canonical.file_name().unwrap_or_default().to_string_lossy(),
+                        output_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                        original_bytes / 1024,
+                        output_bytes / 1024
+                    ))
+                    .show();
+            }
+            let mut event = watcher_event(
+                "success",
+                Some(format!(
+                    "已处理 {}",
+                    output_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )),
+            );
+            event.file = Some(canonical.to_string_lossy().to_string());
+            event.output = Some(output_path.to_string_lossy().to_string());
+            event.original_bytes = Some(original_bytes);
+            event.output_bytes = Some(output_bytes);
+            if settings.show_floating_result {
+                let state = app.state::<DesktopState>();
+                let created = show_dropzone_ready(&app, &state).unwrap_or(false);
+                if created {
+                    thread::sleep(Duration::from_millis(250));
+                }
+                emit_event(&app, event);
+                configure_dropzone_dimensions(&app, &state, 420.0, 320.0);
+            } else {
+                emit_event(&app, event);
+            }
+        }
+        Err(error) => {
+            let mut event = watcher_event("error", Some(error));
+            event.file = canonical
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string);
+            emit_event(&app, event);
+        }
+    }
+    processing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&canonical);
+}
+
+#[tauri::command]
+async fn select_folder(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    kind: String,
+) -> Result<Option<String>, String> {
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .set_can_create_directories(true)
+        .blocking_pick_folder()
+    else {
+        return Ok(None);
+    };
+    let path = selected.into_path().map_err(|error| error.to_string())?;
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    let mut folders = state
+        .folders
+        .lock()
+        .map_err(|_| "文件夹状态不可用".to_string())?;
+    match kind.as_str() {
+        "input" => folders.input = Some(path.clone()),
+        "output" => folders.output = Some(path.clone()),
+        "export" => folders.export = Some(path.clone()),
+        _ => return Err("不支持的文件夹类型".to_string()),
+    }
+    Ok(Some(user_facing_path(&path)))
+}
+
+/// Returns the OS convention for screenshots when it exists, so the folder
+/// watcher can provide the same hands-off screenshot flow as Clop.
+#[tauri::command]
+fn suggest_screenshot_folder() -> Option<String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        home.join("Pictures").join("Screenshots"),
+        home.join("OneDrive").join("Pictures").join("Screenshots"),
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates = [home.join("Desktop"), home.join("Pictures")];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let candidates = [
+        home.join("Pictures").join("Screenshots"),
+        home.join("Pictures"),
+    ];
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir())
+        .map(|path| user_facing_path(&path))
+}
+
+#[tauri::command]
+async fn select_images(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<NativeImage>, String> {
+    let Some(files) = app
+        .dialog()
+        .file()
+        .add_filter("图片", IMAGE_EXTENSIONS)
+        .blocking_pick_files()
+    else {
+        return Ok(Vec::new());
+    };
+    let mut images = Vec::new();
+    for selected in files {
+        let path = selected.into_path().map_err(|error| error.to_string())?;
+        if !is_image(&path) {
+            continue;
+        }
+        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        let data = fs::read(&canonical).map_err(|error| error.to_string())?;
+        state
+            .source_files
+            .lock()
+            .map_err(|_| "文件授权状态不可用".to_string())?
+            .insert(canonical.clone());
+        let preview = heic_input::preview(&data)?;
+        images.push(NativeImage {
+            name: canonical
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+                .to_string(),
+            mime_type: mime_for(&canonical).to_string(),
+            path: canonical.to_string_lossy().to_string(),
+            data: BASE64.encode(data),
+            preview_data: preview.as_ref().map(|(data, _, _)| BASE64.encode(data)),
+            preview_type: preview.as_ref().map(|_| "image/png".to_string()),
+            width: preview.as_ref().map(|(_, w, _)| *w),
+            height: preview.as_ref().map(|(_, _, h)| *h),
+        });
+    }
+    Ok(images)
+}
+
+#[tauri::command]
+async fn select_image_entries(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<NativeImageEntry>, String> {
+    let Some(files) = app
+        .dialog()
+        .file()
+        .add_filter("图片", IMAGE_EXTENSIONS)
+        .blocking_pick_files()
+    else {
+        return Ok(Vec::new());
+    };
+    let paths = files
+        .into_iter()
+        .filter_map(|selected| selected.into_path().ok())
+        .collect();
+    native_image_entries_from_paths_with_progress(paths, &state, |current, total| {
+        emit_image_import_progress(&app, current, total)
+    })
+}
+
+#[tauri::command]
+async fn select_image_folder_entries(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<NativeImageEntry>, String> {
+    let Some(selected) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(Vec::new());
+    };
+    let folder = selected.into_path().map_err(|error| error.to_string())?;
+    let folder = fs::canonicalize(&folder).unwrap_or(folder);
+    native_image_entries_from_paths_with_progress(
+        collect_image_paths(&folder),
+        &state,
+        |current, total| emit_image_import_progress(&app, current, total),
+    )
+}
+
+fn clipboard_image() -> Result<Option<ClipboardImage>, String> {
+    clipboard_bitmap()?
+        .as_ref()
+        .map(encode_clipboard_bitmap)
+        .transpose()
+}
+
+fn clipboard_bitmap() -> Result<Option<arboard::ImageData<'static>>, String> {
+    let arboard_result = arboard::Clipboard::new()
+        .map_err(|error| error.to_string())
+        .and_then(|mut clipboard| match clipboard.get_image() {
+            Ok(image) => Ok(Some(image.to_owned_img())),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        });
+
+    #[cfg(target_os = "windows")]
+    {
+        match arboard_result {
+            Ok(Some(image)) => Ok(Some(image)),
+            Ok(None) => windows_clipboard_dib_image(),
+            Err(primary_error) => match windows_clipboard_dib_image() {
+                Ok(Some(image)) => Ok(Some(image)),
+                Ok(None) => Err(primary_error),
+                Err(fallback_error) => Err(format!(
+                    "无法读取 Windows 剪贴板图片：{primary_error}；{fallback_error}"
+                )),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    arboard_result
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(|| "Windows DIB 位图头不完整".to_string())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| "Windows DIB 位图头不完整".to_string())
+}
+
+/// Windows screenshot tools commonly publish CF_DIB instead of the newer
+/// CF_DIBV5/PNG formats supported by arboard. A DIB is a BMP without the
+/// 14-byte file header, so prepend that header before decoding it with image.
+#[cfg(any(target_os = "windows", test))]
+fn dib_to_bmp_bytes(dib: &[u8]) -> Result<Vec<u8>, String> {
+    let header_size = read_le_u32(dib, 0)? as usize;
+    if header_size < 12 || header_size > dib.len() {
+        return Err("Windows DIB 位图头无效".to_string());
+    }
+
+    let pixel_offset = if header_size == 12 {
+        let bit_count = read_le_u16(dib, 10)? as usize;
+        let palette_entries = if bit_count <= 8 {
+            1usize << bit_count
+        } else {
+            0
+        };
+        header_size
+            .checked_add(palette_entries.saturating_mul(3))
+            .ok_or_else(|| "Windows DIB 调色板无效".to_string())?
+    } else {
+        if header_size < 40 {
+            return Err("不支持该 Windows DIB 位图头".to_string());
+        }
+        let bit_count = read_le_u16(dib, 14)? as usize;
+        let compression = read_le_u32(dib, 16)?;
+        let colors_used = read_le_u32(dib, 32)? as usize;
+        let palette_entries = if colors_used > 0 {
+            colors_used
+        } else if bit_count <= 8 {
+            1usize << bit_count
+        } else {
+            0
+        };
+        let external_masks = if header_size == 40 {
+            match compression {
+                3 => 12,
+                6 => 16,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        header_size
+            .checked_add(external_masks)
+            .and_then(|value| value.checked_add(palette_entries.saturating_mul(4)))
+            .ok_or_else(|| "Windows DIB 像素偏移无效".to_string())?
+    };
+    if pixel_offset > dib.len() {
+        return Err("Windows DIB 像素数据不完整".to_string());
+    }
+
+    let file_size = 14usize
+        .checked_add(dib.len())
+        .ok_or_else(|| "Windows DIB 数据过大".to_string())?;
+    let bmp_pixel_offset = 14usize
+        .checked_add(pixel_offset)
+        .ok_or_else(|| "Windows DIB 像素偏移无效".to_string())?;
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&(bmp_pixel_offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Ok(bmp)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_clipboard_dib_image() -> Result<Option<arboard::ImageData<'static>>, String> {
+    use windows_sys::Win32::System::{
+        DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        },
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+        Ole::{CF_DIB, CF_DIBV5},
+    };
+
+    let format = [CF_DIBV5, CF_DIB]
+        .into_iter()
+        .find(|format| unsafe { IsClipboardFormatAvailable(*format as u32) } != 0);
+    let Some(format) = format else {
+        return Ok(None);
+    };
+
+    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+        return Err("Windows 剪贴板暂时被占用".to_string());
+    }
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+    let _guard = ClipboardGuard;
+
+    let handle = unsafe { GetClipboardData(format as u32) };
+    if handle.is_null() {
+        return Err("Windows 剪贴板没有返回位图数据".to_string());
+    }
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 {
+        return Err("Windows 剪贴板位图为空".to_string());
+    }
+    let pointer = unsafe { GlobalLock(handle) };
+    if pointer.is_null() {
+        return Err("Windows 剪贴板位图暂时不可读".to_string());
+    }
+    let dib = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), size) }.to_vec();
+    unsafe {
+        GlobalUnlock(handle);
+    }
+
+    let bmp = dib_to_bmp_bytes(&dib)?;
+    let rgba = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+        .map_err(|error| format!("无法解码 Windows 剪贴板位图：{error}"))?
+        .to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok(Some(arboard::ImageData {
+        width: width as usize,
+        height: height as usize,
+        bytes: Cow::Owned(rgba.into_raw()),
+    }))
+}
+
+/// Encode clipboard pixels only after the monitor has established that the
+/// clipboard actually changed. `CompressionType::Best` used to run on every
+/// poll (including an unchanged multi-megapixel screenshot), which could keep
+/// one CPU core busy indefinitely. The cached image is re-encoded by the real
+/// optimisation pipeline immediately afterwards, so a fast, lossless transfer
+/// PNG is both sufficient and substantially cheaper here.
+fn encode_clipboard_bitmap(image: &arboard::ImageData<'_>) -> Result<ClipboardImage, String> {
+    let mut png = Vec::new();
+    PngEncoder::new_with_quality(&mut png, CompressionType::Fast, PngFilterType::Adaptive)
+        .write_image(
+            &image.bytes,
+            image.width as u32,
+            image.height as u32,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(ClipboardImage {
+        data: BASE64.encode(png),
+    })
+}
+
+/// A bounded-cost fingerprint for clipboard pixels. Hashing a handful of
+/// evenly distributed samples avoids scanning and PNG-compressing tens of
+/// megabytes every second while still detecting same-sized replacement images.
+fn clipboard_bitmap_fingerprint(image: &arboard::ImageData<'_>) -> String {
+    const SAMPLE_COUNT: usize = 32;
+    const SAMPLE_BYTES: usize = 128;
+
+    let bytes = image.bytes.as_ref();
+    let mut digest = Sha256::new();
+    digest.update(image.width.to_le_bytes());
+    digest.update(image.height.to_le_bytes());
+    digest.update(bytes.len().to_le_bytes());
+    if bytes.len() <= SAMPLE_COUNT * SAMPLE_BYTES {
+        digest.update(bytes);
+    } else {
+        let last_start = bytes.len().saturating_sub(SAMPLE_BYTES);
+        for index in 0..SAMPLE_COUNT {
+            let start = last_start.saturating_mul(index) / (SAMPLE_COUNT - 1);
+            digest.update(&bytes[start..start + SAMPLE_BYTES]);
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn clipboard_payload_is_new(
+    was_enabled: bool,
+    deliver_initial: bool,
+    change_token: Option<u64>,
+    last_change_token: Option<u64>,
+    fingerprint_changed: bool,
+) -> bool {
+    if !was_enabled {
+        return deliver_initial;
+    }
+    change_token
+        .map(|token| last_change_token != Some(token))
+        .unwrap_or(fingerprint_changed)
+}
+
+/// Return the operating system's cheap clipboard generation counter where it
+/// is available. This lets the monitor avoid even requesting the bitmap while
+/// the clipboard is unchanged. Linux desktop stacks do not expose one common
+/// counter, so they fall back to the bounded pixel fingerprint above.
+#[cfg(target_os = "macos")]
+fn clipboard_change_token() -> Option<u64> {
+    use objc2_app_kit::NSPasteboard;
+
+    Some(NSPasteboard::generalPasteboard().changeCount().max(0) as u64)
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_change_token() -> Option<u64> {
+    // SAFETY: GetClipboardSequenceNumber has no parameters and only reads the
+    // system-maintained clipboard counter.
+    let token = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    // Zero means Windows could not supply a sequence number. Falling back to
+    // the bounded pixel fingerprint keeps monitoring functional in that case.
+    (token != 0).then_some(token as u64)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn clipboard_change_token() -> Option<u64> {
+    None
+}
+
+/// Returns `Some` whenever the clipboard contains a file-list payload, even
+/// when none of those files are supported images. Finder/Explorer often also
+/// expose a thumbnail bitmap for copied PDF/Office documents; preserving the
+/// distinction prevents PicLite from compressing that document icon. Some
+/// apps (notably WeChat on macOS) publish both an image-looking protected temp
+/// path and real bitmap data. When every image candidate is unreadable, return
+/// `None` so the caller can fall back to the bitmap instead of surfacing EPERM.
+fn select_readable_clipboard_image_paths<F>(
+    paths: Vec<PathBuf>,
+    mut can_read: F,
+) -> Option<Vec<PathBuf>>
+where
+    F: FnMut(&Path) -> bool,
+{
+    let mut had_image_candidate = false;
+    let mut readable_images = Vec::new();
+
+    for path in paths {
+        if !is_image(&path) {
+            continue;
+        }
+        had_image_candidate = true;
+        if can_read(&path) {
+            readable_images.push(path);
+        }
+    }
+
+    if had_image_candidate && readable_images.is_empty() {
+        None
+    } else {
+        Some(readable_images)
+    }
+}
+
+fn clipboard_file_image_paths() -> Result<Option<Vec<String>>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    match clipboard.get().file_list() {
+        Ok(paths) => {
+            Ok(
+                select_readable_clipboard_image_paths(paths, |path| fs::File::open(path).is_ok())
+                    .map(|paths| {
+                        paths
+                            .into_iter()
+                            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect()
+                    }),
+            )
+        }
+        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn clipboard_image_paths() -> Result<Vec<String>, String> {
+    Ok(clipboard_file_image_paths()?.unwrap_or_default())
+}
+
+#[tauri::command]
+async fn read_clipboard_image() -> Result<Option<ClipboardImage>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        if clipboard_file_image_paths()?.is_some() {
+            return Ok(None);
+        }
+        clipboard_image()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn read_clipboard_paths() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(clipboard_image_paths)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn write_clipboard_image(data: &[u8]) -> Result<(), String> {
+    let decoded =
+        decode_static_oriented(data).map_err(|error| format!("无法读取结果图：{error}"))?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: Cow::Owned(rgba.into_raw()),
+        })
+        .map_err(|error| format!("无法写入系统剪贴板：{error}"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImagePathClipboardMode {
+    FileOnly,
+    FileWithBitmapFallback,
+}
+
+fn image_path_clipboard_mode(target_os: &str) -> ImagePathClipboardMode {
+    if target_os == "windows" {
+        ImagePathClipboardMode::FileOnly
+    } else {
+        ImagePathClipboardMode::FileWithBitmapFallback
+    }
+}
+
+fn copy_image_path_payload_with<F, B>(
+    path: &Path,
+    mode: ImagePathClipboardMode,
+    mut copy_file: F,
+    mut copy_bitmap: B,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+    B: FnMut(&[u8]) -> Result<(), String>,
+{
+    match (mode, copy_file(path)) {
+        (_, Ok(())) => Ok(()),
+        (ImagePathClipboardMode::FileOnly, Err(error)) => Err(error),
+        (ImagePathClipboardMode::FileWithBitmapFallback, Err(_)) => {
+            let data = fs::read(path).map_err(|error| format!("无法读取结果图：{error}"))?;
+            copy_bitmap(&data)
+        }
+    }
+}
+
+fn copy_image_path_to_clipboard(path: &Path) -> Result<(), String> {
+    // Windows must keep the encoded result as a file payload. Falling back to a
+    // bitmap makes receiving apps re-encode WebP as a much larger PNG.
+    copy_image_path_payload_with(
+        path,
+        image_path_clipboard_mode(std::env::consts::OS),
+        copy_file_to_clipboard,
+        write_clipboard_image,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "set the clipboard to (POSIX file (item 1 of argv))",
+            "-e",
+            "end run",
+        ])
+        .arg(path)
+        .status()
+        .map_err(|error| format!("无法调用系统剪贴板：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("系统未能复制压缩文件".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $path=$env:PICLITE_CLIPBOARD_FILE; if (-not [IO.File]::Exists($path)) { throw 'Result file does not exist' }; $files=New-Object System.Collections.Specialized.StringCollection; [void]$files.Add($path); [System.Windows.Forms.Clipboard]::Clear(); [System.Windows.Forms.Clipboard]::SetFileDropList($files)";
+    let mut last_error = None;
+    for _ in 0..3 {
+        let status = Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .env("PICLITE_CLIPBOARD_FILE", path)
+            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+            .status();
+        match status {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_error = Some(format!("PowerShell exit code {status}")),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    Err(format!(
+        "系统未能复制压缩文件：{}",
+        last_error.unwrap_or_else(|| "unknown clipboard error".to_string())
+    ))
+}
+
+fn suppress_next_clipboard_observation(state: &DesktopState) {
+    let until = now_ms().saturating_add(3_000).min(u64::MAX as u128) as u64;
+    state
+        .clipboard_ignore_until_ms
+        .store(until, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    let uri = Url::from_file_path(path)
+        .map_err(|_| "无法生成结果文件地址".to_string())?
+        .to_string();
+    for (program, arguments) in [
+        ("wl-copy", vec!["--type", "text/uri-list"]),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", "text/uri-list", "-i"],
+        ),
+    ] {
+        let Ok(mut child) = Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(uri.as_bytes());
+        }
+        if child.wait().map(|status| status.success()).unwrap_or(false) {
+            return Ok(());
+        }
+    }
+    let data = fs::read(path).map_err(|error| error.to_string())?;
+    write_clipboard_image(&data)
+}
+
+fn portable_directory() -> Option<PathBuf> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let directory = exe.parent()?;
+    directory
+        .join("portable.txt")
+        .is_file()
+        .then(|| directory.join("PicLite-Data"))
+}
+
+fn config_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    portable_directory()
+        .map(Ok)
+        .unwrap_or_else(|| app.path().app_config_dir().map_err(|e| e.to_string()))
+}
+
+fn clipboard_cache_path(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
+    let directory = portable_directory()
+        .map(Ok)
+        .unwrap_or_else(|| app.path().app_cache_dir().map_err(|e| e.to_string()))?
+        .join("clipboard");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let safe = safe_file_name(file_name);
+    let safe = if safe.trim().is_empty() {
+        "piclite-result.png".to_string()
+    } else {
+        safe
+    };
+    Ok(directory.join(format!("{}-{safe}", now_ms())))
+}
+
+#[tauri::command]
+async fn copy_image_data(data: Vec<u8>, state: State<'_, DesktopState>) -> Result<(), String> {
+    let result = tauri::async_runtime::spawn_blocking(move || write_clipboard_image(&data))
+        .await
+        .map_err(|error| error.to_string())?;
+    if result.is_ok() {
+        suppress_next_clipboard_observation(&state);
+    }
+    result
+}
+
+#[tauri::command]
+async fn copy_compressed_data(
+    app: AppHandle,
+    data: Vec<u8>,
+    file_name: String,
+    state: State<'_, DesktopState>,
+) -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let path = clipboard_cache_path(&app, &file_name)?;
+        fs::write(&path, &data).map_err(|error| format!("无法缓存压缩文件：{error}"))?;
+        // A real file drop is ideal for clients that accept attachments. Some
+        // Windows clipboard hosts reject CF_HDROP, so always fall back to an
+        // actual bitmap instead of reporting a false copy failure.
+        if copy_file_to_clipboard(&path).is_err() {
+            write_clipboard_image(&data)?;
+        }
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.is_ok() {
+        suppress_next_clipboard_observation(&state);
+    }
+    result
+}
+
+#[tauri::command]
+async fn cache_image_data(
+    app: AppHandle,
+    data: Vec<u8>,
+    file_name: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if data.is_empty() || data.len() > 128 * 1024 * 1024 {
+            return Err("剪贴板图片无效或超过 128 MB".to_string());
+        }
+        decode_static_oriented(&data).map_err(|error| format!("无法读取剪贴板图片：{error}"))?;
+        let path = clipboard_cache_path(&app, &file_name)?;
+        fs::write(&path, &data).map_err(|error| format!("无法缓存剪贴板图片：{error}"))?;
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn copy_image_path(path: String, state: State<'_, DesktopState>) -> Result<(), String> {
+    // Suppress before writing because Windows can notify the monitor before the
+    // blocking clipboard operation returns to this async command.
+    suppress_next_clipboard_observation(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err("结果文件已经不存在".to_string());
+        }
+        copy_image_path_to_clipboard(&path)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.is_ok() {
+        suppress_next_clipboard_observation(&state);
+    }
+    result
+}
+
+#[tauri::command]
+async fn copy_text(text: String, state: State<'_, DesktopState>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+        clipboard.set_text(text).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    suppress_next_clipboard_observation(&state);
+    Ok(())
+}
+
+fn collect_font_files(directory: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth > 8 || files.len() >= 4_000 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_font_files(&path, depth + 1, files);
+            continue;
+        }
+        let supported = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "ttf" | "otf" | "ttc" | "otc"
+                )
+            })
+            .unwrap_or(false);
+        if supported {
+            files.push(path);
+        }
+    }
+}
+
+fn system_font_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        directories.extend([
+            PathBuf::from("/System/Library/Fonts"),
+            PathBuf::from("/Library/Fonts"),
+        ]);
+        if let Some(home) = std::env::var_os("HOME") {
+            directories.push(PathBuf::from(home).join("Library/Fonts"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(windows) = std::env::var_os("WINDIR") {
+            directories.push(PathBuf::from(windows).join("Fonts"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            directories.push(PathBuf::from(local).join("Microsoft/Windows/Fonts"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        directories.extend([
+            PathBuf::from("/usr/share/fonts"),
+            PathBuf::from("/usr/local/share/fonts"),
+        ]);
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            directories.push(home.join(".fonts"));
+            directories.push(home.join(".local/share/fonts"));
+        }
+    }
+    directories
+}
+
+fn read_system_fonts() -> Vec<SystemFontInfo> {
+    let mut files = Vec::new();
+    for directory in system_font_directories() {
+        collect_font_files(&directory, 0, &mut files);
+    }
+    files.sort();
+    let mut families = BTreeMap::new();
+    for path in files {
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1);
+        for index in 0..face_count {
+            let Ok(face) = ttf_parser::Face::parse(&data, index) else {
+                continue;
+            };
+            let family = face
+                .names()
+                .into_iter()
+                .filter(|name| name.name_id == 16)
+                .find_map(|name| name.to_string().filter(|value| !value.trim().is_empty()))
+                .or_else(|| {
+                    face.names()
+                        .into_iter()
+                        .filter(|name| name.name_id == 1)
+                        .find_map(|name| name.to_string().filter(|value| !value.trim().is_empty()))
+                });
+            let Some(family) = family else { continue };
+            families
+                .entry(family.clone())
+                .or_insert_with(|| SystemFontInfo {
+                    family,
+                    path: path.to_string_lossy().to_string(),
+                    face_index: index,
+                });
+        }
+    }
+    families.into_values().take(2_000).collect()
+}
+
+#[tauri::command]
+async fn list_system_fonts() -> Result<Vec<SystemFontInfo>, String> {
+    tauri::async_runtime::spawn_blocking(read_system_fonts)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn read_be_u16(data: &[u8], offset: usize) -> Result<u16, String> {
+    let bytes = data
+        .get(offset..offset + 2)
+        .ok_or_else(|| "字体文件结构不完整".to_string())?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> Result<u32, String> {
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| "字体文件结构不完整".to_string())?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn extract_font_face(data: &[u8], face_index: u32) -> Result<Vec<u8>, String> {
+    if data.get(0..4) != Some(b"ttcf") {
+        if face_index != 0 {
+            return Err("字体字面索引无效".to_string());
+        }
+        return Ok(data.to_vec());
+    }
+
+    let face_count = read_be_u32(data, 8)?;
+    if face_index >= face_count {
+        return Err("字体字面索引无效".to_string());
+    }
+    let face_offset = read_be_u32(data, 12 + face_index as usize * 4)? as usize;
+    let table_count = read_be_u16(data, face_offset + 4)? as usize;
+    let directory_length = 12usize
+        .checked_add(
+            table_count
+                .checked_mul(16)
+                .ok_or_else(|| "字体表数量异常".to_string())?,
+        )
+        .ok_or_else(|| "字体目录过大".to_string())?;
+    let directory_end = face_offset
+        .checked_add(directory_length)
+        .ok_or_else(|| "字体目录过大".to_string())?;
+    let directory = data
+        .get(face_offset..directory_end)
+        .ok_or_else(|| "字体目录不完整".to_string())?;
+    let mut output = directory.to_vec();
+    let mut head_offset = None;
+
+    for table_index in 0..table_count {
+        let record = face_offset + 12 + table_index * 16;
+        let tag = data
+            .get(record..record + 4)
+            .ok_or_else(|| "字体表记录不完整".to_string())?;
+        let source_offset = read_be_u32(data, record + 8)? as usize;
+        let length = read_be_u32(data, record + 12)? as usize;
+        let source_end = source_offset
+            .checked_add(length)
+            .ok_or_else(|| "字体表过大".to_string())?;
+        let table = data
+            .get(source_offset..source_end)
+            .ok_or_else(|| "字体表数据不完整".to_string())?;
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
+        let target_offset = output.len();
+        let target_offset_u32 =
+            u32::try_from(target_offset).map_err(|_| "字体文件过大".to_string())?;
+        output[12 + table_index * 16 + 8..12 + table_index * 16 + 12]
+            .copy_from_slice(&target_offset_u32.to_be_bytes());
+        output.extend_from_slice(table);
+        if tag == b"head" {
+            head_offset = Some(target_offset);
+        }
+    }
+
+    while output.len() % 4 != 0 {
+        output.push(0);
+    }
+    if let Some(head) = head_offset.filter(|offset| offset + 12 <= output.len()) {
+        output[head + 8..head + 12].fill(0);
+        let checksum = output.chunks_exact(4).fold(0u32, |sum, chunk| {
+            sum.wrapping_add(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        });
+        output[head + 8..head + 12]
+            .copy_from_slice(&0xB1B0_AFBAu32.wrapping_sub(checksum).to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn validated_system_font_path(value: &str) -> Result<PathBuf, String> {
+    let path = fs::canonicalize(value).map_err(|error| format!("无法读取字体文件：{error}"))?;
+    let allowed = system_font_directories()
+        .into_iter()
+        .filter_map(|directory| fs::canonicalize(directory).ok())
+        .any(|directory| path.starts_with(directory));
+    if !allowed || !path.is_file() {
+        return Err("只能读取系统字体目录中的字体文件".to_string());
+    }
+    let supported = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc" | "otc"
+            )
+        })
+        .unwrap_or(false);
+    if !supported {
+        return Err("不支持该字体文件格式".to_string());
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+async fn read_system_font(path: String, face_index: u32) -> Result<SystemFontData, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = validated_system_font_path(&path)?;
+        let metadata = fs::metadata(&path).map_err(|error| format!("无法读取字体信息：{error}"))?;
+        if metadata.len() > 64 * 1024 * 1024 {
+            return Err("字体文件超过 64 MB，无法载入".to_string());
+        }
+        let data = fs::read(path).map_err(|error| format!("无法读取字体文件：{error}"))?;
+        let face = extract_font_face(&data, face_index)?;
+        Ok(SystemFontData {
+            data: BASE64.encode(face),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn upload_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = config_directory(app)?;
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join("upload-profile.json"))
+}
+
+fn app_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = config_directory(app)?;
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join("app-profile.json"))
+}
+
+#[tauri::command]
+async fn load_app_profile(app: AppHandle) -> Result<Option<NativeAppProfile>, String> {
+    let path = app_profile_path(&app)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let data = fs::read(&path).map_err(|error| format!("无法读取应用配置：{error}"))?;
+    serde_json::from_slice(&data)
+        .map(Some)
+        .map_err(|error| format!("应用配置已损坏：{error}"))
+}
+
+#[tauri::command]
+async fn save_app_profile(app: AppHandle, profile: NativeAppProfile) -> Result<(), String> {
+    let path = app_profile_path(&app)?;
+    let data = serde_json::to_vec_pretty(&profile).map_err(|error| error.to_string())?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("无法保存应用配置：{error}"))?;
+    file.write_all(&data)
+        .map_err(|error| format!("无法保存应用配置：{error}"))?;
+    file.flush().map_err(|error| error.to_string())
+}
+
+fn imported_fonts_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = config_directory(app)?.join("watermark-fonts");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory)
+}
+
+fn imported_fonts_manifest_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = config_directory(app)?;
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join("watermark-fonts.json"))
+}
+
+fn read_imported_font_manifest(app: &AppHandle) -> Result<Vec<StoredImportedFont>, String> {
+    let path = imported_fonts_manifest_path(app)?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read(path).map_err(|error| format!("无法读取已导入字体：{error}"))?;
+    serde_json::from_slice(&data).map_err(|error| format!("已导入字体记录已损坏：{error}"))
+}
+
+#[tauri::command]
+async fn load_imported_fonts(app: AppHandle) -> Result<Vec<ImportedFontData>, String> {
+    let manifest = read_imported_font_manifest(&app)?;
+    let directory = imported_fonts_directory(&app)?;
+    let mut fonts = Vec::new();
+    for font in manifest {
+        let path = directory.join(&font.file_name);
+        let Ok(data) = fs::read(path) else { continue };
+        if data.len() <= 64 * 1024 * 1024 {
+            fonts.push(ImportedFontData {
+                family: font.family,
+                data: BASE64.encode(data),
+            });
+        }
+    }
+    Ok(fonts)
+}
+
+#[tauri::command]
+async fn save_imported_font(app: AppHandle, payload: ImportedFontPayload) -> Result<(), String> {
+    if payload.family.trim().is_empty()
+        || payload.data.is_empty()
+        || payload.data.len() > 64 * 1024 * 1024
+    {
+        return Err("字体文件无效或超过 64 MB".to_string());
+    }
+    let file_name = format!("{:x}.font", Sha256::digest(&payload.data));
+    let directory = imported_fonts_directory(&app)?;
+    let path = directory.join(&file_name);
+    if !path.exists() {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|error| format!("无法缓存字体文件：{error}"))?;
+        file.write_all(&payload.data)
+            .map_err(|error| format!("无法保存字体文件：{error}"))?;
+        file.flush().map_err(|error| error.to_string())?;
+    }
+    let mut manifest = read_imported_font_manifest(&app)?;
+    manifest.retain(|font| font.family != payload.family);
+    manifest.push(StoredImportedFont {
+        family: payload.family,
+        file_name,
+    });
+    let data = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+    fs::write(imported_fonts_manifest_path(&app)?, data)
+        .map_err(|error| format!("无法保存字体记录：{error}"))
+}
+
+#[tauri::command]
+async fn load_upload_profile(app: AppHandle) -> Result<Option<NativeUploadProfile>, String> {
+    let path = upload_profile_path(&app)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let data = fs::read(&path).map_err(|error| format!("无法读取上传配置：{error}"))?;
+    serde_json::from_slice(&data)
+        .map(Some)
+        .map_err(|error| format!("上传配置已损坏：{error}"))
+}
+
+#[tauri::command]
+async fn save_upload_profile(app: AppHandle, profile: NativeUploadProfile) -> Result<(), String> {
+    let path = upload_profile_path(&app)?;
+    let data = serde_json::to_vec_pretty(&profile).map_err(|error| error.to_string())?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("无法保存上传配置：{error}"))?;
+    file.write_all(&data)
+        .map_err(|error| format!("无法保存上传配置：{error}"))?;
+    file.flush().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn reveal_path(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if !target.exists() {
+        return Err("文件已经不存在".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg("-R").arg(&target);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(format!("/select,{}", target.to_string_lossy()));
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(if target.is_dir() {
+            target.as_path()
+        } else {
+            target.parent().unwrap_or_else(|| Path::new("."))
+        });
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开文件位置：{error}"))
+}
+
+#[tauri::command]
+async fn open_image(path: String) -> Result<(), String> {
+    let target = fs::canonicalize(PathBuf::from(path)).map_err(|_| "图片已经不存在".to_string())?;
+    if !target.is_file() || !is_image(&target) {
+        return Err("目标不是支持的图片文件".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{
+            UI::Shell::ShellExecuteW, UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        };
+
+        // `canonicalize` adds the `\\?\` device prefix on Windows. A file URL
+        // made from that path is not understood by every registered image
+        // viewer. ShellExecuteW accepts a normal filesystem path and delegates
+        // directly to the user's default application association.
+        let target = PathBuf::from(user_facing_path(&target));
+        let operation = "open\0".encode_utf16().collect::<Vec<_>>();
+        let target = target
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result as isize <= 32 {
+            return Err(format!(
+                "无法调用系统默认看图程序（错误代码 {}）",
+                result as isize
+            ));
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        command.arg(&target);
+        return command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法用系统看图程序打开图片：{error}"));
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let mut command = Command::new("xdg-open");
+        command.arg(&target);
+        return command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("无法用系统看图程序打开图片：{error}"));
+    }
+}
+
+const URL_PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn encoded_object_key(value: &str) -> String {
+    value
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| utf8_percent_encode(part, URL_PATH_ENCODE_SET).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn remote_object_key(payload: &NativeUploadPayload) -> Result<String, String> {
+    let file_name = safe_file_name(&payload.file_name);
+    if file_name.trim().is_empty() {
+        return Err("图片文件名为空".to_string());
+    }
+    let directory = payload
+        .remote_path
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .map(safe_file_name)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(if directory.is_empty() {
+        file_name
+    } else {
+        format!("{directory}/{file_name}")
+    })
+}
+
+fn endpoint_url(value: &str, scheme: &str) -> Result<Url, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("请填写服务地址".to_string());
+    }
+    let normalized = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("{scheme}://{value}")
+    };
+    Url::parse(&normalized).map_err(|error| format!("服务地址无效：{error}"))
+}
+
+fn joined_public_url(base: &str, key: &str, fallback: &str) -> String {
+    if base.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            base.trim().trim_end_matches('/'),
+            encoded_object_key(key)
+        )
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|error| error.to_string())?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn upload_webdav(payload: &NativeUploadPayload, key: &str) -> Result<String, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let endpoint = payload.endpoint.trim().trim_end_matches('/');
+    let directories = key.split('/').collect::<Vec<_>>();
+    let mut current = endpoint.to_string();
+    for directory in directories.iter().take(directories.len().saturating_sub(1)) {
+        current.push('/');
+        current.push_str(&utf8_percent_encode(directory, URL_PATH_ENCODE_SET).to_string());
+        let mut request = client.request(
+            Method::from_bytes(b"MKCOL").map_err(|error| error.to_string())?,
+            &current,
+        );
+        if !payload.username.is_empty() {
+            request = request.basic_auth(&payload.username, Some(&payload.secret));
+        }
+        let response = request
+            .send()
+            .map_err(|error| format!("WebDAV 建目录失败：{error}"))?;
+        if !(response.status().is_success()
+            || response.status() == StatusCode::METHOD_NOT_ALLOWED
+            || response.status() == StatusCode::CONFLICT)
+        {
+            return Err(format!("WebDAV 建目录失败：HTTP {}", response.status()));
+        }
+    }
+    let upload_url = format!("{endpoint}/{}", encoded_object_key(key));
+    let mut request = client
+        .put(&upload_url)
+        .header("Content-Type", &payload.mime_type)
+        .body(payload.data.clone());
+    if !payload.username.is_empty() {
+        request = request.basic_auth(&payload.username, Some(&payload.secret));
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("WebDAV 上传失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("WebDAV 上传失败：HTTP {}", response.status()));
+    }
+    Ok(joined_public_url(
+        &payload.public_base_url,
+        key,
+        &upload_url,
+    ))
+}
+
+fn upload_s3_compatible(
+    payload: &NativeUploadPayload,
+    key: &str,
+    service_name: &str,
+    force_path_style: bool,
+) -> Result<String, String> {
+    if payload.bucket.trim().is_empty()
+        || payload.access_key.trim().is_empty()
+        || payload.secret.is_empty()
+    {
+        return Err(format!(
+            "{service_name} 需要 Bucket、Access Key ID 和 Secret Access Key"
+        ));
+    }
+    let endpoint = endpoint_url(&payload.endpoint, "https")?;
+    let scheme = endpoint.scheme();
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| format!("{service_name} 服务地址缺少主机名"))?;
+    let path_style = force_path_style || payload.path_style;
+    let request_host = if path_style {
+        host.to_string()
+    } else {
+        format!("{}.{}", payload.bucket.trim_matches('/'), host)
+    };
+    let host_header = match endpoint.port() {
+        Some(port) => format!("{request_host}:{port}"),
+        None => request_host.clone(),
+    };
+    let base_path = endpoint.path().trim_matches('/');
+    let object_path = if path_style && base_path.is_empty() {
+        format!(
+            "{}/{}",
+            payload.bucket.trim_matches('/'),
+            encoded_object_key(key)
+        )
+    } else if path_style {
+        format!(
+            "{base_path}/{}/{}",
+            payload.bucket.trim_matches('/'),
+            encoded_object_key(key)
+        )
+    } else if base_path.is_empty() {
+        encoded_object_key(key)
+    } else {
+        format!("{base_path}/{}", encoded_object_key(key))
+    };
+    let canonical_uri = format!("/{object_path}");
+    let upload_url = match endpoint.port() {
+        Some(port) => format!("{scheme}://{request_host}:{port}{canonical_uri}"),
+        None => format!("{scheme}://{request_host}{canonical_uri}"),
+    };
+    let region = if payload.region.trim().is_empty() {
+        if service_name == "R2" {
+            "auto"
+        } else {
+            "us-east-1"
+        }
+    } else {
+        payload.region.trim()
+    };
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+    let payload_hash = sha256_hex(&payload.data);
+    let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers = format!(
+        "content-type:{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        payload.mime_type, host_header, payload_hash, amz_date
+    );
+    let canonical_request =
+        format!("PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let scope = format!("{date}/{region}/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let date_key = hmac_sha256(
+        format!("AWS4{}", payload.secret).as_bytes(),
+        date.as_bytes(),
+    )?;
+    let region_key = hmac_sha256(&date_key, region.as_bytes())?;
+    let service_key = hmac_sha256(&region_key, b"s3")?;
+    let signing_key = hmac_sha256(&service_key, b"aws4_request")?;
+    let signature = hmac_sha256(&signing_key, string_to_sign.as_bytes())?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        payload.access_key, scope, signed_headers, signature
+    );
+    let response = Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|error| error.to_string())?
+        .put(&upload_url)
+        .header("Content-Type", &payload.mime_type)
+        .header("Host", host_header)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("x-amz-date", amz_date)
+        .header("Authorization", authorization)
+        .body(payload.data.clone())
+        .send()
+        .map_err(|error| format!("{service_name} 上传失败：{error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "{service_name} 上传失败：HTTP {status} {}",
+            detail.chars().take(180).collect::<String>()
+        ));
+    }
+    Ok(joined_public_url(
+        &payload.public_base_url,
+        key,
+        &upload_url,
+    ))
+}
+
+fn upload_oss(payload: &NativeUploadPayload, key: &str) -> Result<String, String> {
+    if payload.bucket.trim().is_empty()
+        || payload.access_key.trim().is_empty()
+        || payload.secret.is_empty()
+    {
+        return Err("OSS 需要 Bucket、Access Key ID 和 Access Key Secret".to_string());
+    }
+    let endpoint = endpoint_url(&payload.endpoint, "https")?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| "OSS 服务地址缺少主机名".to_string())?;
+    let bucket = payload.bucket.trim();
+    let upload_host = if host.starts_with(&format!("{bucket}.")) {
+        host.to_string()
+    } else {
+        format!("{bucket}.{host}")
+    };
+    let port = endpoint
+        .port()
+        .map(|value| format!(":{value}"))
+        .unwrap_or_default();
+    let object_path = encoded_object_key(key);
+    let upload_url = format!(
+        "{}://{}{}/{}",
+        endpoint.scheme(),
+        upload_host,
+        port,
+        object_path
+    );
+    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let canonical_resource = format!("/{bucket}/{key}");
+    let string_to_sign = format!(
+        "PUT\n\n{}\n{}\n{}",
+        payload.mime_type, date, canonical_resource
+    );
+    let mut mac = Hmac::<Sha1>::new_from_slice(payload.secret.as_bytes())
+        .map_err(|error| error.to_string())?;
+    mac.update(string_to_sign.as_bytes());
+    let signature = BASE64.encode(mac.finalize().into_bytes());
+    let response = Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|error| error.to_string())?
+        .put(&upload_url)
+        .header("Content-Type", &payload.mime_type)
+        .header("Date", date)
+        .header(
+            "Authorization",
+            format!("OSS {}:{signature}", payload.access_key),
+        )
+        .body(payload.data.clone())
+        .send()
+        .map_err(|error| format!("OSS 上传失败：{error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "OSS 上传失败：HTTP {status} {}",
+            detail.chars().take(180).collect::<String>()
+        ));
+    }
+    Ok(joined_public_url(
+        &payload.public_base_url,
+        key,
+        &upload_url,
+    ))
+}
+
+fn ftp_read_response(reader: &mut BufReader<TcpStream>) -> Result<(u16, String), String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| error.to_string())?;
+    if line.len() < 3 {
+        return Err("FTP 返回了无效响应".to_string());
+    }
+    let code = line[..3]
+        .parse::<u16>()
+        .map_err(|_| format!("FTP 响应无效：{line}"))?;
+    let multiline = line.as_bytes().get(3) == Some(&b'-');
+    let mut response = line;
+    if multiline {
+        loop {
+            let mut next = String::new();
+            reader
+                .read_line(&mut next)
+                .map_err(|error| error.to_string())?;
+            let finished = next.starts_with(&format!("{code} "));
+            response.push_str(&next);
+            if finished {
+                break;
+            }
+        }
+    }
+    Ok((code, response.trim().to_string()))
+}
+
+fn ftp_command(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut TcpStream,
+    command: &str,
+) -> Result<(u16, String), String> {
+    writer
+        .write_all(command.as_bytes())
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(b"\r\n")
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    ftp_read_response(reader)
+}
+
+fn upload_ftp(payload: &NativeUploadPayload, key: &str) -> Result<String, String> {
+    let endpoint = endpoint_url(&payload.endpoint, "ftp")?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| "FTP 地址缺少主机名".to_string())?;
+    let port = if payload.port == 0 {
+        endpoint.port().unwrap_or(21)
+    } else {
+        payload.port
+    };
+    let control =
+        TcpStream::connect((host, port)).map_err(|error| format!("FTP 连接失败：{error}"))?;
+    control
+        .set_read_timeout(Some(Duration::from_secs(45)))
+        .map_err(|error| error.to_string())?;
+    control
+        .set_write_timeout(Some(Duration::from_secs(45)))
+        .map_err(|error| error.to_string())?;
+    let peer_ip = control.peer_addr().map_err(|error| error.to_string())?.ip();
+    let mut writer = control.try_clone().map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(control);
+    let (code, message) = ftp_read_response(&mut reader)?;
+    if code != 220 {
+        return Err(format!("FTP 拒绝连接：{message}"));
+    }
+    let username = if payload.username.is_empty() {
+        "anonymous"
+    } else {
+        &payload.username
+    };
+    let (code, message) = ftp_command(&mut reader, &mut writer, &format!("USER {username}"))?;
+    if code == 331 {
+        let (code, message) = ftp_command(
+            &mut reader,
+            &mut writer,
+            &format!("PASS {}", payload.secret),
+        )?;
+        if code != 230 {
+            return Err(format!("FTP 登录失败：{message}"));
+        }
+    } else if code != 230 {
+        return Err(format!("FTP 登录失败：{message}"));
+    }
+    let (code, message) = ftp_command(&mut reader, &mut writer, "TYPE I")?;
+    if code != 200 {
+        return Err(format!("FTP 无法切换二进制模式：{message}"));
+    }
+    let mut components = endpoint
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    components.extend(
+        key.split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string),
+    );
+    let file_name = components
+        .pop()
+        .ok_or_else(|| "FTP 远端文件名为空".to_string())?;
+    for directory in &components {
+        let (code, _) = ftp_command(&mut reader, &mut writer, &format!("CWD {directory}"))?;
+        if code != 250 {
+            let (code, message) =
+                ftp_command(&mut reader, &mut writer, &format!("MKD {directory}"))?;
+            if code != 257 {
+                return Err(format!("FTP 建目录失败：{message}"));
+            }
+            let (code, message) =
+                ftp_command(&mut reader, &mut writer, &format!("CWD {directory}"))?;
+            if code != 250 {
+                return Err(format!("FTP 进入目录失败：{message}"));
+            }
+        }
+    }
+    let (code, message) = ftp_command(&mut reader, &mut writer, "PASV")?;
+    if code != 227 {
+        return Err(format!("FTP 无法进入被动模式：{message}"));
+    }
+    let numbers = message
+        .split(['(', ')'])
+        .nth(1)
+        .ok_or_else(|| format!("FTP 被动模式响应无效：{message}"))?
+        .split(',')
+        .filter_map(|value| value.trim().parse::<u16>().ok())
+        .collect::<Vec<_>>();
+    if numbers.len() != 6 {
+        return Err(format!("FTP 被动模式响应无效：{message}"));
+    }
+    let data_port = numbers[4] * 256 + numbers[5];
+    let mut data_stream = TcpStream::connect((peer_ip, data_port))
+        .map_err(|error| format!("FTP 数据连接失败：{error}"))?;
+    let (code, message) = ftp_command(&mut reader, &mut writer, &format!("STOR {file_name}"))?;
+    if code != 125 && code != 150 {
+        return Err(format!("FTP 无法写入文件：{message}"));
+    }
+    data_stream
+        .write_all(&payload.data)
+        .map_err(|error| format!("FTP 上传中断：{error}"))?;
+    let _ = data_stream.shutdown(Shutdown::Write);
+    drop(data_stream);
+    let (code, message) = ftp_read_response(&mut reader)?;
+    if code != 226 && code != 250 {
+        return Err(format!("FTP 上传未完成：{message}"));
+    }
+    let _ = ftp_command(&mut reader, &mut writer, "QUIT");
+    let remote_path = format!("/{}/{}", components.join("/"), file_name).replace("//", "/");
+    let fallback = format!("ftp://{host}:{port}/{}", encoded_object_key(&remote_path));
+    Ok(joined_public_url(&payload.public_base_url, key, &fallback))
+}
+
+fn upload_sftp(payload: &NativeUploadPayload, key: &str) -> Result<String, String> {
+    let endpoint = endpoint_url(&payload.endpoint, "sftp")?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| "SFTP 地址缺少主机名".to_string())?;
+    let port = if payload.port == 0 {
+        endpoint.port().unwrap_or(22)
+    } else {
+        payload.port
+    };
+    let tcp =
+        TcpStream::connect((host, port)).map_err(|error| format!("SFTP 连接失败：{error}"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(|error| error.to_string())?;
+    tcp.set_write_timeout(Some(Duration::from_secs(60)))
+        .map_err(|error| error.to_string())?;
+    let mut session = Session::new().map_err(|error| error.to_string())?;
+    session.set_tcp_stream(tcp);
+    session
+        .handshake()
+        .map_err(|error| format!("SSH 握手失败：{error}"))?;
+
+    let (host_key, _) = session
+        .host_key()
+        .ok_or_else(|| "服务器没有提供 SSH Host Key".to_string())?;
+    let known_hosts_path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|path| path.join(".ssh").join("known_hosts"))
+        .ok_or_else(|| "无法定位 SSH known_hosts；请先用 ssh 命令连接一次服务器".to_string())?;
+    if !known_hosts_path.exists() {
+        return Err("未找到 SSH known_hosts；请先用 ssh 命令连接一次服务器并确认指纹".to_string());
+    }
+    let mut known_hosts = session.known_hosts().map_err(|error| error.to_string())?;
+    known_hosts
+        .read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)
+        .map_err(|error| format!("无法读取 known_hosts：{error}"))?;
+    match known_hosts.check_port(host, port, host_key) {
+        CheckResult::Match => {}
+        CheckResult::Mismatch => {
+            return Err("SSH Host Key 与 known_hosts 不一致，已拒绝连接".to_string())
+        }
+        CheckResult::NotFound => {
+            return Err(
+                "SSH Host Key 不在 known_hosts 中；请先用 ssh 命令连接一次服务器".to_string(),
+            )
+        }
+        CheckResult::Failure => return Err("无法校验 SSH Host Key".to_string()),
+    }
+
+    let username = if payload.username.trim().is_empty() {
+        endpoint.username()
+    } else {
+        payload.username.trim()
+    };
+    if username.is_empty() {
+        return Err("请填写 SFTP 用户名".to_string());
+    }
+    if payload.key_path.trim().is_empty() {
+        session
+            .userauth_password(username, &payload.secret)
+            .map_err(|error| format!("SFTP 登录失败：{error}"))?;
+    } else {
+        session
+            .userauth_pubkey_file(
+                username,
+                None,
+                Path::new(payload.key_path.trim()),
+                if payload.secret.is_empty() {
+                    None
+                } else {
+                    Some(payload.secret.as_str())
+                },
+            )
+            .map_err(|error| format!("SFTP 私钥登录失败：{error}"))?;
+    }
+    if !session.authenticated() {
+        return Err("SFTP 身份验证失败".to_string());
+    }
+    let sftp = session.sftp().map_err(|error| error.to_string())?;
+    let endpoint_path = endpoint.path();
+    let mut components = endpoint_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    components.extend(
+        key.split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string),
+    );
+    let file_name = components
+        .pop()
+        .ok_or_else(|| "SFTP 远端文件名为空".to_string())?;
+    let mut directory = if endpoint_path.trim_matches('/').is_empty() {
+        PathBuf::new()
+    } else {
+        PathBuf::from("/")
+    };
+    for component in &components {
+        directory.push(component);
+        if sftp.stat(&directory).is_err() {
+            sftp.mkdir(&directory, 0o755)
+                .map_err(|error| format!("SFTP 建目录失败 {}：{error}", directory.display()))?;
+        }
+    }
+    let target = directory.join(&file_name);
+    let mut remote = sftp
+        .create(&target)
+        .map_err(|error| format!("SFTP 创建文件失败：{error}"))?;
+    remote
+        .write_all(&payload.data)
+        .map_err(|error| format!("SFTP 上传中断：{error}"))?;
+    remote.flush().map_err(|error| error.to_string())?;
+    let fallback = format!(
+        "sftp://{host}:{port}/{}",
+        encoded_object_key(&target.to_string_lossy())
+    );
+    Ok(joined_public_url(&payload.public_base_url, key, &fallback))
+}
+
+fn upload_image_sync(payload: NativeUploadPayload) -> Result<UploadResult, String> {
+    if payload.data.is_empty() {
+        return Err("图片内容为空".to_string());
+    }
+    if payload.data.len() > 512 * 1024 * 1024 {
+        return Err("单张图片不能超过 512 MB".to_string());
+    }
+    let key = remote_object_key(&payload)?;
+    let url = match payload.provider.as_str() {
+        "webdav" => upload_webdav(&payload, &key)?,
+        "s3" => upload_s3_compatible(&payload, &key, "S3", false)?,
+        "r2" => upload_s3_compatible(&payload, &key, "R2", true)?,
+        "oss" => upload_oss(&payload, &key)?,
+        "ftp" => upload_ftp(&payload, &key)?,
+        "sftp" => upload_sftp(&payload, &key)?,
+        _ => return Err("不支持的上传服务".to_string()),
+    };
+    Ok(UploadResult {
+        url,
+        remote_path: key,
+    })
+}
+
+#[tauri::command]
+async fn upload_image(payload: NativeUploadPayload) -> Result<UploadResult, String> {
+    tauri::async_runtime::spawn_blocking(move || upload_image_sync(payload))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn export_images(
+    payload: ExportPayload,
+    state: State<'_, DesktopState>,
+) -> Result<CommandResult, String> {
+    let result = (|| -> Result<Vec<String>, String> {
+        if payload.items.is_empty() {
+            return Err("没有可导出的图片".to_string());
+        }
+        if !matches!(
+            payload.mode.as_str(),
+            "overwrite" | "same-folder" | "fixed-folder"
+        ) {
+            return Err("不支持的导出方式".to_string());
+        }
+        let fixed_folder = if payload.mode == "fixed-folder" {
+            payload
+                .fixed_folder
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| state.folders.lock().ok()?.export.clone())
+                .ok_or_else(|| "请先选择固定输出文件夹".to_string())?
+        } else {
+            PathBuf::new()
+        };
+        let authorized = state
+            .source_files
+            .lock()
+            .map_err(|_| "文件授权状态不可用".to_string())?;
+        let mut paths = Vec::new();
+        for item in payload.items {
+            let source = item.source_path.as_deref().map(PathBuf::from);
+            if matches!(payload.mode.as_str(), "overwrite" | "same-folder") {
+                let Some(path) = source.as_ref() else {
+                    return Err("这张图片没有源文件路径".to_string());
+                };
+                let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                if !authorized.contains(&canonical) {
+                    return Err("源文件没有经过文件选择器授权".to_string());
+                }
+            }
+            let target = match payload.mode.as_str() {
+                "overwrite" => source.ok_or_else(|| "缺少源文件路径".to_string())?,
+                "same-folder" => {
+                    let source = source.ok_or_else(|| "缺少源文件路径".to_string())?;
+                    available_path(
+                        source
+                            .parent()
+                            .ok_or_else(|| "无法定位源文件夹".to_string())?,
+                        &item.output_name,
+                    )?
+                }
+                _ => available_path(&fixed_folder, &item.output_name)?,
+            };
+            if payload.mode == "overwrite" {
+                fs::write(&target, item.data).map_err(|error| error.to_string())?;
+            } else {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                fs::write(&target, item.data).map_err(|error| error.to_string())?;
+            }
+            paths.push(target.to_string_lossy().to_string());
+        }
+        Ok(paths)
+    })();
+    Ok(match result {
+        Ok(paths) => CommandResult {
+            ok: true,
+            paths: Some(paths),
+            error: None,
+        },
+        Err(error) => CommandResult {
+            ok: false,
+            paths: None,
+            error: Some(error),
+        },
+    })
+}
+
+fn validated_watch_rules(
+    settings: &WatcherSettings,
+) -> Result<Vec<(PathBuf, WatcherSettings)>, String> {
+    let profiles = if settings.profiles.is_empty() {
+        vec![settings.clone()]
+    } else {
+        settings.profiles.clone()
+    };
+    let mut rules: Vec<(PathBuf, WatcherSettings)> = Vec::new();
+    for mut profile in profiles {
+        if let Some(rule) = &profile.folder_rename {
+            if rule.folder_pattern.trim().is_empty() {
+                return Err("请填写文件夹匹配规则".into());
+            }
+            Regex::new(&rule.folder_pattern).map_err(|e| format!("文件夹匹配规则无效：{e}"))?;
+            if rule.rename_template.contains("{index") {
+                return Err("监控命名请使用 {name} 区分图片；序号仅用于批量预览重命名".into());
+            }
+        }
+        if profile.max_width == 0
+            || profile.max_height == 0
+            || !profile.scale.is_finite()
+            || profile.scale <= 0.0
+        {
+            return Err("图片尺寸必须大于 0".into());
+        }
+        if !profile.output_folder.is_empty() && profile.output_folder != "@same-folder" {
+            fs::create_dir_all(&profile.output_folder).map_err(|e| e.to_string())?;
+            profile.output_folder = fs::canonicalize(&profile.output_folder)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .to_string();
+        }
+        let inputs = if profile.input_folders.is_empty() {
+            vec![profile.input_folder.clone()]
+        } else {
+            profile.input_folders.clone()
+        };
+        for input in inputs {
+            let root =
+                fs::canonicalize(&input).map_err(|_| format!("监测文件夹不存在：{input}"))?;
+            if !root.is_dir() {
+                return Err("监测目标必须是文件夹".into());
+            }
+            if rules
+                .iter()
+                .any(|(other, _)| root.starts_with(other) || other.starts_with(&root))
+            {
+                return Err("监测目录重复或相互包含，请使用互不重叠的根目录".into());
+            }
+            rules.push((root, profile.clone()));
+        }
+    }
+    for (root, _) in &rules {
+        for (source, rule) in &rules {
+            if rule.output_folder != "@same-folder" {
+                let output = if rule.output_folder.is_empty() {
+                    source.join("PicLite")
+                } else {
+                    PathBuf::from(&rule.output_folder)
+                };
+                if root.starts_with(&output) || (root != source && output.starts_with(root)) {
+                    return Err("输出目录与监测目录冲突，可能造成循环处理".into());
+                }
+            }
+        }
+    }
+    if rules.is_empty() {
+        return Err("请选择来源文件夹".into());
+    }
+    Ok(rules)
+}
+
+#[tauri::command]
+async fn validate_watcher(settings: WatcherSettings) -> CommandResult {
+    match validated_watch_rules(&settings) {
+        Ok(_) => CommandResult {
+            ok: true,
+            paths: None,
+            error: None,
+        },
+        Err(error) => CommandResult {
+            ok: false,
+            paths: None,
+            error: Some(error),
+        },
+    }
+}
+
+#[tauri::command]
+async fn start_watcher(
+    app: AppHandle,
+    settings: WatcherSettings,
+    scan_existing: Option<bool>,
+    state: State<'_, DesktopState>,
+) -> Result<CommandResult, String> {
+    let result = (|| -> Result<(), String> {
+        let initial_scan_root = if scan_existing.unwrap_or(false) {
+            fs::canonicalize(&settings.input_folder).ok()
+        } else {
+            None
+        };
+        let rules = validated_watch_rules(&settings)?;
+        let app_handle = app.clone();
+        let processing = state.processing.clone();
+        let processing_for_callback = processing.clone();
+        let rules_for_callback = rules.clone();
+        let mut seen = BTreeMap::new();
+        let mut watcher = notify::recommended_watcher(
+            move |result: notify::Result<notify::Event>| match result {
+                Ok(event) if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) => {
+                    let created = matches!(event.kind, EventKind::Create(_));
+                    let paths = event.paths.into_iter().flat_map(|path| {
+                        if path.is_dir() {
+                            // Directory metadata changes are emitted for normal
+                            // file writes on Windows and macOS. Recursively
+                            // scanning those events reprocessed arbitrary parts
+                            // of the tree, so only scan a directory when it was
+                            // newly created (for example, a copied folder).
+                            if created {
+                                collect_image_paths(&path)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            vec![path]
+                        }
+                    });
+                    for path in paths {
+                        let Some((source_root, rule)) = rules_for_callback
+                            .iter()
+                            .filter(|(input, _)| path.starts_with(input))
+                            .max_by_key(|(input, _)| input.components().count())
+                        else {
+                            continue;
+                        };
+                        if !path.is_file() || !is_image(&path) || registered_output(&path) {
+                            continue;
+                        }
+                        let output = if rule.output_folder.is_empty() {
+                            Some(source_root.join("PicLite"))
+                        } else if rule.output_folder == "@same-folder" {
+                            None
+                        } else {
+                            Some(PathBuf::from(&rule.output_folder))
+                        };
+                        if output.is_some_and(|output| path.starts_with(output)) {
+                            continue;
+                        }
+                        if let Ok(metadata) = fs::metadata(&path) {
+                            let signature = (metadata.len(), metadata.modified().ok());
+                            if seen.get(&path) == Some(&signature) {
+                                continue;
+                            }
+                            if seen.len() > 20_000 {
+                                seen.clear();
+                            }
+                            seen.insert(path.clone(), signature);
+                        }
+                        let app = app_handle.clone();
+                        let mut settings = rule.clone();
+                        settings.input_folder = source_root.to_string_lossy().to_string();
+                        let processing = processing_for_callback.clone();
+                        thread::spawn(move || {
+                            process_watched_file(app, path, settings, processing)
+                        });
+                    }
+                }
+                Err(error) => {
+                    emit_event(&app_handle, watcher_event("error", Some(error.to_string())))
+                }
+                _ => {}
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        for (input, _) in &rules {
+            watcher
+                .watch(input, RecursiveMode::Recursive)
+                .map_err(|error| format!("无法监测 {}：{error}", input.display()))?;
+        }
+        *state
+            .watcher
+            .lock()
+            .map_err(|_| "监测状态不可用".to_string())? = Some(watcher);
+        *state
+            .watcher_settings
+            .lock()
+            .map_err(|_| "监测设置不可用".to_string())? = Some(settings.clone());
+        if scan_existing.unwrap_or(false) {
+            for (source_root, rule) in &rules {
+                if initial_scan_root.as_ref() != Some(source_root) {
+                    continue;
+                }
+                for path in collect_initial_watch_paths(source_root, rule) {
+                    let app = app.clone();
+                    let processing = processing.clone();
+                    let mut settings = rule.clone();
+                    settings.input_folder = source_root.to_string_lossy().to_string();
+                    thread::spawn(move || process_watched_file(app, path, settings, processing));
+                }
+            }
+        }
+        emit_event(
+            &app,
+            watcher_event(
+                "started",
+                Some(format!("正在监测 {} 个文件夹", rules.len())),
+            ),
+        );
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        emit_event(&app, watcher_event("error", Some(error.clone())));
+    }
+    Ok(match result {
+        Ok(()) => CommandResult {
+            ok: true,
+            paths: None,
+            error: None,
+        },
+        Err(error) => CommandResult {
+            ok: false,
+            paths: None,
+            error: Some(error),
+        },
+    })
+}
+
+#[tauri::command]
+async fn stop_watcher(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<CommandResult, String> {
+    state
+        .watcher
+        .lock()
+        .map_err(|_| "监测状态不可用".to_string())?
+        .take();
+    state
+        .watcher_settings
+        .lock()
+        .map_err(|_| "监测设置不可用".to_string())?
+        .take();
+    emit_event(
+        &app,
+        watcher_event("stopped", Some("文件夹监测已停止".to_string())),
+    );
+    Ok(CommandResult {
+        ok: true,
+        paths: None,
+        error: None,
+    })
+}
+
+#[tauri::command]
+async fn get_watcher_state(state: State<'_, DesktopState>) -> Result<WatcherState, String> {
+    let active = state
+        .watcher
+        .lock()
+        .map_err(|_| "监测状态不可用".to_string())?
+        .is_some();
+    let settings = state
+        .watcher_settings
+        .lock()
+        .map_err(|_| "监测设置不可用".to_string())?
+        .clone();
+    Ok(WatcherState { active, settings })
+}
+
+fn create_tray(app: &tauri::App) -> tauri::Result<()> {
+    let preferences = MenuItem::with_id(app, "preferences", "设置…", true, None::<&str>)?;
+    let batch = MenuItem::with_id(app, "show", "完整工作台", true, None::<&str>)?;
+    let floating = MenuItem::with_id(app, "dropzone", "打开悬浮窗", true, None::<&str>)?;
+    let optimise = MenuItem::with_id(app, "optimise_clipboard", "优化", true, None::<&str>)?;
+    let aggressive = MenuItem::with_id(
+        app,
+        "optimise_clipboard_aggressive",
+        "激进优化",
+        true,
+        None::<&str>,
+    )?;
+    let downscale = MenuItem::with_id(app, "downscale_clipboard", "缩小尺寸", true, None::<&str>)?;
+    let quicklook = MenuItem::with_id(app, "quicklook_clipboard", "快速预览", true, None::<&str>)?;
+    let clipboard = Submenu::with_items(
+        app,
+        "剪贴板操作",
+        true,
+        &[&optimise, &aggressive, &downscale, &quicklook],
+    )?;
+
+    let upload_current = MenuItem::with_id(
+        app,
+        "upload_current",
+        "上传当前悬浮结果",
+        true,
+        None::<&str>,
+    )?;
+    let image_host_settings =
+        MenuItem::with_id(app, "image_host_settings", "图床设置…", true, None::<&str>)?;
+    let image_hosting = Submenu::with_items(
+        app,
+        "上传图床",
+        true,
+        &[&upload_current, &image_host_settings],
+    )?;
+
+    let pause = MenuItem::with_id(app, "pause_automatic", "暂停自动优化", true, None::<&str>)?;
+    let check_updates = MenuItem::with_id(app, "check_updates", "检查更新", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, "about", "关于 PicLite", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "完全退出 PicLite", true, None::<&str>)?;
+    let separator_one = PredefinedMenuItem::separator(app)?;
+    let separator_two = PredefinedMenuItem::separator(app)?;
+    let separator_three = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &preferences,
+            &batch,
+            &floating,
+            &separator_one,
+            &clipboard,
+            &image_hosting,
+            &separator_two,
+            &pause,
+            &about,
+            &check_updates,
+            &separator_three,
+            &quit,
+        ],
+    )?;
+
+    let initial_tray_icon = TauriImage::from_bytes(include_bytes!("../icons/tray-light.png"))
+        .unwrap_or_else(|_| app.default_window_icon().expect("missing app icon").clone());
+    #[allow(unused_variables)]
+    let tray = TrayIconBuilder::with_id("piclite-tray")
+        .tooltip("PicLite · Drop to optimise")
+        .icon(initial_tray_icon)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_window(app, "main"),
+            "preferences" => open_preferences_from_menu(app, None),
+            "image_host_settings" => {
+                open_preferences_from_menu(app, Some("image_host_settings"));
+            }
+            "dropzone" => {
+                open_dropzone_from_callback(app, None);
+            }
+            "about" => {
+                let _ = open_url("https://github.com/amiaoapp/PicLite");
+            }
+            "check_updates" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match check_for_updates().await {
+                        Ok(info) if info.available => {
+                            let release_url = info.release_url.clone();
+                            app.dialog()
+                                .message(format!(
+                                    "发现 PicLite {}。\n\n当前版本：{}",
+                                    info.latest_version, info.current_version
+                                ))
+                                .title("PicLite 更新检查")
+                                .kind(MessageDialogKind::Info)
+                                .buttons(MessageDialogButtons::OkCancelCustom(
+                                    "打开下载页面".into(),
+                                    "稍后".into(),
+                                ))
+                                .show(move |open_release| {
+                                    if open_release {
+                                        let _ = open_url(&release_url);
+                                    }
+                                });
+                        }
+                        Ok(info) => {
+                            app.dialog()
+                                .message(format!("PicLite {} 已是最新版。", info.current_version))
+                                .title("PicLite 更新检查")
+                                .kind(MessageDialogKind::Info)
+                                .show(|_| {});
+                        }
+                        Err(error) => {
+                            app.dialog()
+                                .message(format!("检查更新失败。\n\n{error}"))
+                                .title("PicLite 更新检查")
+                                .kind(MessageDialogKind::Error)
+                                .show(|_| {});
+                        }
+                    }
+                });
+            }
+            "quit" => {
+                app.state::<DesktopState>()
+                    .quitting
+                    .store(true, Ordering::Relaxed);
+                app.exit(0);
+            }
+            action => {
+                if matches!(
+                    action,
+                    "optimise_clipboard"
+                        | "optimise_clipboard_aggressive"
+                        | "downscale_clipboard"
+                        | "upload_current"
+                ) {
+                    let action = match action {
+                        "optimise_clipboard" => "optimise_clipboard",
+                        "optimise_clipboard_aggressive" => "optimise_clipboard_aggressive",
+                        "downscale_clipboard" => "downscale_clipboard",
+                        "upload_current" => "upload_current",
+                        _ => unreachable!(),
+                    };
+                    open_dropzone_from_callback(app, Some(action));
+                } else {
+                    let _ = app.emit("tray:action", action.to_string());
+                }
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_window(tray.app_handle(), "main");
+            }
+        })
+        .build(app)?;
+    #[cfg(target_os = "macos")]
+    let _ = tray.set_icon_as_template(false);
+    Ok(())
+}
+
+fn apply_tray_icon_theme(app: &AppHandle, dark: bool) {
+    let bytes = if dark {
+        include_bytes!("../icons/tray-dark.png").as_slice()
+    } else {
+        include_bytes!("../icons/tray-light.png").as_slice()
+    };
+    if let (Some(tray), Ok(icon)) = (
+        app.tray_by_id("piclite-tray"),
+        TauriImage::from_bytes(bytes),
+    ) {
+        let _ = tray.set_icon(Some(icon));
+        #[cfg(target_os = "macos")]
+        let _ = tray.set_icon_as_template(false);
+    }
+}
+
+#[tauri::command]
+async fn set_tray_theme(app: AppHandle, theme: String) -> Result<(), String> {
+    let dark = if theme == "dark" {
+        true
+    } else if theme == "light" {
+        false
+    } else {
+        app.get_webview_window("main")
+            .and_then(|window| window.theme().ok())
+            .map(|theme| theme == Theme::Dark)
+            .unwrap_or(false)
+    };
+    apply_tray_icon_theme(&app, dark);
+    Ok(())
+}
+
+fn version_parts(version: &str) -> Vec<u64> {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let latest = version_parts(latest);
+    let current = version_parts(current);
+    let count = latest.len().max(current.len());
+    (0..count)
+        .map(|index| {
+            (
+                *latest.get(index).unwrap_or(&0),
+                *current.get(index).unwrap_or(&0),
+            )
+        })
+        .find(|(left, right)| left != right)
+        .is_some_and(|(left, right)| left > right)
+}
+
+#[tauri::command]
+async fn check_for_updates() -> Result<UpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let release = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(format!("PicLite/{current_version}"))
+            .build()
+            .map_err(|error| format!("无法创建更新检查请求：{error}"))?
+            .get("https://api.github.com/repos/amiaoapp/PicLite/releases/latest")
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| format!("连接 GitHub 检查更新失败：{error}"))?
+            .text()
+            .map_err(|error| format!("读取 GitHub 版本信息失败：{error}"))?;
+        let release = serde_json::from_str::<GithubRelease>(&release)
+            .map_err(|error| format!("解析 GitHub 版本信息失败：{error}"))?;
+        let latest_version = release.tag_name.trim_start_matches(['v', 'V']).to_string();
+        Ok(UpdateInfo {
+            available: version_is_newer(&latest_version, &current_version),
+            current_version,
+            latest_version,
+            release_url: release.html_url,
+            published_at: release.published_at,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn fetch_plugin_source(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        const MAX_PLUGIN_BYTES: usize = 8 * 1024 * 1024;
+        let parsed = Url::parse(&url).map_err(|_| "插件地址格式无效".to_string())?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("只支持 HTTP(S) 插件地址".to_string());
+        }
+        let response = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent(format!(
+                "PicLite/{}/PluginRuntime",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build()
+            .map_err(|error| format!("无法创建插件请求：{error}"))?
+            .get(parsed)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| format!("读取插件失败：{error}"))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_PLUGIN_BYTES as u64)
+        {
+            return Err("插件页面超过 8 MB，已停止载入".to_string());
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|error| format!("读取插件内容失败：{error}"))?;
+        if bytes.len() > MAX_PLUGIN_BYTES {
+            return Err("插件页面超过 8 MB，已停止载入".to_string());
+        }
+        String::from_utf8(bytes.to_vec()).map_err(|_| "插件页面不是有效的 UTF-8 文本".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status();
+
+    #[cfg(target_os = "windows")]
+    let status = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let status = Command::new("xdg-open").arg(url).status();
+
+    status
+        .map_err(|error| format!("无法打开浏览器：{error}"))?
+        .success()
+        .then_some(())
+        .ok_or_else(|| "系统没有成功打开浏览器".to_string())
+}
+
+fn allowed_external_url(parsed: &Url) -> bool {
+    let host = parsed.host_str().unwrap_or_default();
+    parsed.scheme() == "https"
+        && match host {
+            "github.com" => parsed.path().starts_with("/amiaoapp/PicLite"),
+            "appmiao.com" | "www.appmiao.com" | "space.bilibili.com" | "v.douyin.com"
+            | "youtube.com" | "www.youtube.com" | "x.com" | "www.x.com" | "t.me" => true,
+            _ => false,
+        }
+}
+
+#[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    let parsed = Url::parse(&url).map_err(|_| "链接格式无效".to_string())?;
+    if !allowed_external_url(&parsed) {
+        return Err("该外部链接不在 PicLite 的允许列表中".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || open_url(&url))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn deliver_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
+    if app.get_webview_window("dropzone").is_none() {
+        if let Ok(mut pending) = app.state::<DesktopState>().pending_clipboard.lock() {
+            *pending = Some(PendingClipboard::Paths { paths });
+        }
+        let _ = ensure_dropzone_window(app);
+    } else {
+        let _ = app.emit("clipboard:paths", paths);
+    }
+}
+
+fn deliver_clipboard_image(app: &AppHandle, image: ClipboardImage) {
+    if app.get_webview_window("dropzone").is_none() {
+        if let Ok(mut pending) = app.state::<DesktopState>().pending_clipboard.lock() {
+            *pending = Some(PendingClipboard::Image { data: image.data });
+        }
+        let _ = ensure_dropzone_window(app);
+    } else {
+        let _ = app.emit("clipboard:image", image);
+    }
+}
+
+fn start_clipboard_monitor(app: AppHandle) {
+    thread::spawn(move || {
+        let mut was_enabled = false;
+        let mut last_fingerprint: Option<String> = None;
+        let mut last_change_token: Option<u64> = None;
+        loop {
+            let (enabled, quitting, ignore_until_ms) = {
+                let state = app.state::<DesktopState>();
+                (
+                    state.clipboard_monitor_enabled.load(Ordering::Relaxed),
+                    state.quitting.load(Ordering::Relaxed),
+                    state.clipboard_ignore_until_ms.load(Ordering::Relaxed),
+                )
+            };
+            if quitting {
+                return;
+            }
+            if !enabled {
+                was_enabled = false;
+                last_fingerprint = None;
+                last_change_token = None;
+                // Observe a startup preference sync quickly. A long disabled
+                // sleep could make the first Windows screenshot become the
+                // baseline and disappear before monitoring woke up.
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
+            // macOS and Windows expose a generation counter that changes only
+            // when clipboard contents change. Previously every pass decoded
+            // and PNG-compressed the same bitmap; for a large screenshot that
+            // alone could sustain 20–30% CPU usage.
+            let change_token = clipboard_change_token();
+            if let Some(change_token) = change_token {
+                if was_enabled && last_change_token == Some(change_token) {
+                    thread::sleep(Duration::from_millis(650));
+                    continue;
+                }
+            }
+
+            let observed = match clipboard_file_image_paths() {
+                Ok(Some(paths)) => {
+                    // A copied document may expose both a file path and its
+                    // Finder/Explorer thumbnail as a bitmap. A file-list takes
+                    // precedence, and non-image files are deliberately ignored.
+                    if paths.is_empty() {
+                        was_enabled = true;
+                        last_fingerprint = Some("non-image-file-list".to_string());
+                    } else {
+                        let fingerprint = format!("paths:{}", paths.join("\u{1f}"));
+                        let ignored = ignore_until_ms > now_ms().min(u64::MAX as u128) as u64;
+                        let fingerprint_changed =
+                            last_fingerprint.as_deref() != Some(fingerprint.as_str());
+                        let should_deliver = clipboard_payload_is_new(
+                            was_enabled,
+                            cfg!(target_os = "windows"),
+                            change_token,
+                            last_change_token,
+                            fingerprint_changed,
+                        );
+                        last_fingerprint = Some(fingerprint);
+                        was_enabled = true;
+                        if should_deliver && !ignored {
+                            deliver_clipboard_paths(&app, paths);
+                        }
+                    }
+                    true
+                }
+                Ok(None) => {
+                    let bitmap = clipboard_bitmap();
+                    match bitmap {
+                        Ok(Some(image)) => {
+                            let fingerprint = clipboard_bitmap_fingerprint(&image);
+                            let ignored = ignore_until_ms > now_ms().min(u64::MAX as u128) as u64;
+                            let fingerprint_changed =
+                                last_fingerprint.as_deref() != Some(fingerprint.as_str());
+                            let should_deliver = clipboard_payload_is_new(
+                                was_enabled,
+                                cfg!(target_os = "windows"),
+                                change_token,
+                                last_change_token,
+                                fingerprint_changed,
+                            );
+                            last_fingerprint = Some(fingerprint);
+                            was_enabled = true;
+                            if should_deliver && !ignored {
+                                if let Ok(encoded) = encode_clipboard_bitmap(&image) {
+                                    deliver_clipboard_image(&app, encoded);
+                                }
+                            }
+                            true
+                        }
+                        Ok(None) => {
+                            was_enabled = true;
+                            last_fingerprint = None;
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            };
+            // Windows can hold the clipboard lock briefly after a copy. Do not
+            // consume the sequence number until the payload was read, so the
+            // next poll retries instead of losing that clipboard change.
+            if observed {
+                last_change_token = change_token;
+            }
+            // A lightweight counter check at this cadence feels immediate to
+            // users without continuously waking the expensive image path.
+            thread::sleep(Duration::from_millis(650));
+        }
+    });
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    #[cfg(target_os = "windows")]
+    if let Some(directory) = portable_directory() {
+        fs::create_dir_all(&directory).expect("Portable data folder is not writable");
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", directory.join("WebView2"));
+    }
+    let app = tauri::Builder::default()
+        // Register this first so a second launch never initializes another
+        // tray, clipboard monitor, or webview. It simply restores the main
+        // window owned by the original PicLite process.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_window(app, "main");
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .manage(DesktopState::default())
+        .setup(|app| {
+            match create_tray(app) {
+                Ok(()) => {
+                    app.state::<DesktopState>()
+                        .tray_available
+                        .store(true, Ordering::Relaxed);
+                    let dark = app
+                        .get_webview_window("main")
+                        .and_then(|window| window.theme().ok())
+                        .map(|theme| theme == Theme::Dark)
+                        .unwrap_or(false);
+                    apply_tray_icon_theme(app.handle(), dark);
+                }
+                Err(error) => eprintln!("PicLite system tray unavailable: {error}"),
+            }
+            #[cfg(target_os = "macos")]
+            app.handle()
+                .set_activation_policy(tauri::ActivationPolicy::Regular)?;
+
+            start_clipboard_monitor(app.handle().clone());
+            click_through::start(app.handle().clone());
+            if std::env::args().any(|argument| argument == "--minimized") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            let state = window.state::<DesktopState>();
+            match event {
+                WindowEvent::CloseRequested { api, .. }
+                    if window.label() != "preferences"
+                        && state.tray_available.load(Ordering::Relaxed)
+                        && !state.quitting.load(Ordering::Relaxed) =>
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    #[cfg(target_os = "macos")]
+                    if window.label() == "main" {
+                        // Red close means "leave the main-window app mode".
+                        // Automation and the menu-bar process stay alive, but
+                        // the running Dock icon disappears until main is shown
+                        // again from a PicLite entry point.
+                        let _ = window
+                            .app_handle()
+                            .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    }
+                }
+                WindowEvent::CloseRequested { .. } if window.label() == "preferences" => {
+                    // Do not keep the settings renderer hidden in memory.
+                    // Allow the close request to destroy it; it is recreated
+                    // lazily by `ensure_preferences_window` next time.
+                }
+                WindowEvent::Resized(_)
+                    if state.tray_available.load(Ordering::Relaxed)
+                        && state.minimize_to_tray.load(Ordering::Relaxed) =>
+                {
+                    if !state.show_in_taskbar_dock.load(Ordering::Relaxed)
+                        && window.is_minimized().unwrap_or(false)
+                    {
+                        let _ = window.hide();
+                    }
+                }
+                WindowEvent::Focused(false)
+                    if window.label() == "main"
+                        && state.tray_available.load(Ordering::Relaxed)
+                        && !state.show_in_taskbar_dock.load(Ordering::Relaxed)
+                        && !state.quitting.load(Ordering::Relaxed) =>
+                {
+                    let _ = window.hide();
+                }
+                _ => {}
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            select_folder,
+            suggest_screenshot_folder,
+            select_images,
+            select_image_entries,
+            select_image_folder_entries,
+            read_images_from_paths,
+            read_image_entries_from_paths,
+            read_clipboard_image,
+            read_clipboard_paths,
+            copy_image_data,
+            copy_compressed_data,
+            cache_image_data,
+            copy_image_path,
+            copy_text,
+            list_system_fonts,
+            read_system_font,
+            load_app_profile,
+            save_app_profile,
+            load_imported_fonts,
+            save_imported_font,
+            reveal_path,
+            open_image,
+            upload_image,
+            load_upload_profile,
+            save_upload_profile,
+            export_images,
+            quick_compress_paths,
+            compress_image_data,
+            compress_image_base64,
+            compress_image_with_watermark_base64,
+            compress_animation_data,
+            compress_animation_base64,
+            compress_animation_with_watermark_base64,
+            configure_global_shortcuts,
+            cleanup_optimised_files,
+            preview_batch_rename,
+            apply_batch_rename,
+            update_desktop_preferences,
+            set_tray_theme,
+            check_for_updates,
+            fetch_plugin_source,
+            open_external_url,
+            show_main_window,
+            show_gallery_window,
+            submit_corner_drop,
+            take_pending_corner_drop,
+            take_pending_clipboard,
+            show_preferences_window,
+            show_dropzone_window,
+            configure_floating_behavior,
+            set_floating_toggle_region,
+            set_floating_collapsed,
+            get_floating_collapsed,
+            move_floating_icon,
+            configure_dropzone_window,
+            resize_dropzone_window,
+            hide_current_window,
+            quit_application,
+            start_watcher,
+            validate_watcher,
+            stop_watcher,
+            get_watcher_state,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building PicLite");
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let state = app_handle.state::<DesktopState>();
+            if state.tray_available.load(Ordering::Relaxed)
+                && !state.quitting.load(Ordering::Relaxed)
+            {
+                api.prevent_exit();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            // The red traffic-light button hides the main window so clipboard
+            // and folder automation can keep running. A click on PicLite's
+            // Dock icon must therefore restore that existing window, just as
+            // reopening a normal document-style macOS app would.
+            show_window(app_handle, "main");
+        }
+        _ => {}
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webp_rejects_invalid_dimensions_without_terminating_process() {
+        for (width, height) in [(0, 1), (1, 0), (16384, 1), (1, 16384)] {
+            for quality in [80, 100] {
+                let error = encode_static_ref(&DynamicImage::new_rgba8(width, height), "webp", quality)
+                    .expect_err("invalid WebP dimensions must return an error");
+                assert!(error.contains("16383"));
+            }
+        }
+        let encoded = encode_static_ref(&DynamicImage::new_rgba8(2, 2), "webp", 80)
+            .expect("the next job must still succeed");
+        assert_eq!(image::load_from_memory(&encoded).unwrap().dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn automatic_compression_skips_unavailable_webp_candidate_for_long_images() {
+        let source = DynamicImage::new_rgba8(1, 16384);
+        let original = encode_static_ref(&source, "png", 100).unwrap();
+        let mut settings = watch_test_settings(Path::new("."));
+        settings.mode = "auto".into();
+        settings.format = "keep".into();
+        settings.scale = 100.0;
+        settings.resize = false;
+        let result = optimize_image_data(original, "png".into(), &settings).unwrap();
+        assert_ne!(result.extension, "webp");
+        assert_eq!(image::load_from_memory(&result.bytes).unwrap().dimensions(), (1, 16384));
+    }
+
+    // Opt-in benchmark: never commit the user's source image or local path.
+    #[test]
+    #[ignore = "manual comparison of release import and compression phases"]
+    fn preview_image_processing_timings() {
+        let root = std::env::temp_dir().join(format!("piclite-timing-{}", now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let (original, extension) = match std::env::var("PICLITE_TIMING_INPUT") {
+            Ok(path) => (
+                fs::read(&path).unwrap(),
+                Path::new(&path)
+                    .extension()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_ascii_lowercase(),
+            ),
+            Err(_) => (
+                include_bytes!("../../public/og.png").to_vec(),
+                "png".to_string(),
+            ),
+        };
+        let path = root.join(format!("artwork.{extension}"));
+        fs::write(&path, &original).unwrap();
+        let state = DesktopState::default();
+        let start = std::time::Instant::now();
+        let entries =
+            native_image_entries_from_paths_with_progress(vec![path], &state, |_, _| {}).unwrap();
+        eprintln!(
+            "TIMING import_ms={:.1} dimensions={}x{} original_bytes={}",
+            start.elapsed().as_secs_f64() * 1000.0,
+            entries[0].width,
+            entries[0].height,
+            original.len()
+        );
+        let start = std::time::Instant::now();
+        let decoded = decode_static_oriented(&original).unwrap();
+        eprintln!(
+            "TIMING decode_ms={:.1}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        for format in ["jpg", "webp", "png"] {
+            let start = std::time::Instant::now();
+            let encoded = encode_static_ref(&decoded, format, 86).unwrap();
+            eprintln!(
+                "TIMING format={format} encode_ms={:.1} bytes={}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                encoded.len()
+            );
+        }
+        let mut settings = watch_test_settings(&root);
+        settings.resize = false;
+        settings.format = "keep".into();
+        settings.scale = 100.0;
+        for mode in ["auto", "lossless", "balanced", "small"] {
+            settings.mode = mode.into();
+            settings.quality = match mode {
+                "lossless" => 92,
+                "small" => 48,
+                _ => 86,
+            };
+            let start = std::time::Instant::now();
+            let result =
+                optimize_image_data(original.clone(), extension.clone(), &settings).unwrap();
+            eprintln!(
+                "TIMING mode={mode} total_ms={:.1} format={} bytes={} sha256={:x}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                result.extension,
+                result.bytes.len(),
+                Sha256::digest(&result.bytes)
+            );
+            // Verify the early-stop optimisation against fully encoding every
+            // format, using this supplied image and the identical parameters.
+            let (w, h) = target_dimensions(decoded.width(), decoded.height(), &settings);
+            let resized = resize_dynamic_fast(decoded.clone(), w, h).unwrap();
+            let quality = match mode {
+                "lossless" => 92,
+                "balanced" => 82,
+                "small" => 48,
+                _ => 86,
+            };
+            let expected = ["jpg", "webp", "png"]
+                .into_iter()
+                .map(|format| {
+                    encode_static_ref(
+                        &resized,
+                        format,
+                        if mode == "lossless" && format == "png" {
+                            100
+                        } else {
+                            quality
+                        },
+                    )
+                    .unwrap()
+                })
+                .min_by_key(Vec::len)
+                .unwrap();
+            assert!(
+                result.bytes == expected,
+                "{mode}: pruning must preserve the exact winning file"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_static_decode_applies_exif_orientation_once() {
+        let pixels = image::RgbImage::from_fn(2, 3, |x, y| {
+            image::Rgb([(x * 80) as u8, (y * 70) as u8, 120])
+        });
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 92)
+            .encode(&pixels, 2, 3, image::ExtendedColorType::Rgb8)
+            .expect("encode JPEG fixture");
+
+        // EXIF orientation 6 means rotate the stored 2×3 pixels 90° clockwise.
+        let exif_payload = [
+            b'E', b'x', b'i', b'f', 0, 0, b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0,
+            0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut oriented = Vec::with_capacity(jpeg.len() + exif_payload.len() + 4);
+        oriented.extend_from_slice(&jpeg[..2]);
+        oriented.extend_from_slice(&[0xff, 0xe1, 0, 34]);
+        oriented.extend_from_slice(&exif_payload);
+        oriented.extend_from_slice(&jpeg[2..]);
+
+        let decoded = decode_static_oriented(&oriented).expect("decode oriented JPEG");
+        assert_eq!(decoded.dimensions(), (3, 2));
+    }
+
+    #[test]
+    fn taskbar_dock_preference_is_backward_compatible() {
+        let legacy: NativeDesktopPreferences = serde_json::from_value(serde_json::json!({
+            "minimizeToTray": true,
+            "clipboardWatcherEnabled": false
+        }))
+        .expect("legacy desktop preferences");
+        assert!(legacy.show_in_taskbar_dock);
+
+        let visible: NativeDesktopPreferences = serde_json::from_value(serde_json::json!({
+            "minimizeToTray": true,
+            "showInTaskbarDock": true,
+            "clipboardWatcherEnabled": false
+        }))
+        .expect("taskbar desktop preferences");
+        assert!(visible.show_in_taskbar_dock);
+    }
+
+    #[test]
+    fn windows_extended_paths_are_presented_without_device_prefixes() {
+        assert_eq!(user_facing_path(Path::new(r"\\?\C:\HPRT")), r"C:\HPRT");
+        assert_eq!(
+            user_facing_path(Path::new(r"\\?\UNC\server\pictures")),
+            r"\\server\pictures"
+        );
+    }
+
+    #[test]
+    fn resize_modes_support_proportional_upscale_fit_and_exact_dimensions() {
+        let mut settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 86, "scale": 200, "format": "keep",
+            "resize": false, "maxWidth": 800, "maxHeight": 800,
+            "stripMetadata": true, "preventLarger": false
+        }))
+        .expect("resize settings");
+        assert_eq!(target_dimensions(400, 200, &settings), (800, 400));
+
+        settings.resize = true;
+        settings.resize_mode = "fit".into();
+        settings.max_width = 900;
+        settings.max_height = 300;
+        assert_eq!(target_dimensions(400, 200, &settings), (600, 300));
+
+        settings.resize_mode = "exact".into();
+        assert_eq!(target_dimensions(400, 200, &settings), (900, 300));
+    }
+
+    #[test]
+    fn simd_resize_preserves_alpha_and_requested_dimensions() {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(20, 10, |x, y| {
+            image::Rgba([
+                x as u8 * 10,
+                y as u8 * 20,
+                140,
+                if x % 2 == 0 { 80 } else { 255 },
+            ])
+        }));
+        let resized = resize_dynamic_fast(image, 80, 40).expect("SIMD resize");
+        assert_eq!(resized.dimensions(), (80, 40));
+        assert!(resized.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255));
+    }
+
+    #[test]
+    fn format_converter_encodes_all_advertised_static_formats() {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 16, |x, y| {
+            image::Rgb([(x * 9) as u8, (y * 13) as u8, ((x + y) * 5) as u8])
+        }));
+        for extension in [
+            "jpg", "jfif", "png", "webp", "avif", "gif", "bmp", "tiff", "ico", "qoi", "tga",
+        ] {
+            let encoded = encode_static_ref(&source, extension, 82)
+                .unwrap_or_else(|error| panic!("encode {extension}: {error}"));
+            assert!(
+                !encoded.is_empty(),
+                "{extension} output should not be empty"
+            );
+            if extension == "avif" {
+                assert!(
+                    encoded.windows(4).any(|window| window == b"ftyp"),
+                    "AVIF container marker"
+                );
+                continue;
+            }
+            let format = match extension {
+                "jpg" | "jfif" => image::ImageFormat::Jpeg,
+                "png" => image::ImageFormat::Png,
+                "webp" => image::ImageFormat::WebP,
+                "gif" => image::ImageFormat::Gif,
+                "bmp" => image::ImageFormat::Bmp,
+                "tiff" => image::ImageFormat::Tiff,
+                "ico" => image::ImageFormat::Ico,
+                "qoi" => image::ImageFormat::Qoi,
+                "tga" => image::ImageFormat::Tga,
+                _ => unreachable!(),
+            };
+            let decoded = image::load_from_memory_with_format(&encoded, format)
+                .unwrap_or_else(|error| panic!("decode {extension}: {error}"));
+            assert_eq!(decoded.dimensions(), (24, 16), "{extension} dimensions");
+        }
+        let large_ico = encode_static_ref(&DynamicImage::new_rgba8(400, 200), "ico", 82)
+            .expect("encode a standards-compliant large icon");
+        assert_eq!(
+            image::load_from_memory_with_format(&large_ico, image::ImageFormat::Ico)
+                .expect("decode resized ICO")
+                .dimensions(),
+            (256, 128),
+        );
+    }
+
+    #[test]
+    fn format_switch_size_guard_keeps_the_latest_smaller_source() {
+        let source = DynamicImage::new_rgb8(32, 24);
+        let original = encode_static_ref(&source, "png", 100).expect("encode compact PNG");
+        let settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 82, "scale": 100, "format": "image/bmp",
+            "resize": false, "maxWidth": 4096, "maxHeight": 4096,
+            "stripMetadata": true, "preventLarger": true
+        }))
+        .expect("format switch settings");
+        let result = optimize_image_data(original.clone(), "png".to_string(), &settings)
+            .expect("guarded format switch");
+        assert_eq!(result.extension, "png");
+        assert_eq!(result.bytes, original);
+    }
+
+    #[test]
+    fn format_switch_does_not_resize_an_already_resized_result_again() {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(400, 200, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8])
+        }));
+        let original = encode_static_ref(&source, "png", 100).expect("encode resize source");
+        let resize_settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 82, "scale": 50, "format": "image/webp",
+            "resize": false, "maxWidth": 4096, "maxHeight": 4096,
+            "stripMetadata": true, "preventLarger": false
+        }))
+        .expect("resize settings");
+        let resized = optimize_image_data(original, "png".to_string(), &resize_settings)
+            .expect("resize source");
+        assert_eq!(
+            image::load_from_memory(&resized.bytes)
+                .unwrap()
+                .dimensions(),
+            (200, 100)
+        );
+
+        let switch_settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 82, "scale": 100, "format": "image/jpeg",
+            "resize": false, "maxWidth": 4096, "maxHeight": 4096,
+            "stripMetadata": true, "preventLarger": true
+        }))
+        .expect("format switch settings");
+        let switched = optimize_image_data(resized.bytes, resized.extension, &switch_settings)
+            .expect("switch resized format");
+        assert_eq!(
+            image::load_from_memory(&switched.bytes)
+                .unwrap()
+                .dimensions(),
+            (200, 100)
+        );
+    }
+
+    #[test]
+    fn rename_template_expands_size_dimensions_and_extension() {
+        let name = render_output_name(
+            "{name}_{width}x{height}_{size}{suffix}.{ext}",
+            "photo",
+            "-piclite",
+            "webp",
+            12_345,
+            1920,
+            1080,
+        );
+        assert_eq!(name, "photo_1920x1080_12345-piclite.webp");
+    }
+
+    #[test]
+    fn automatic_first_pass_measures_all_opaque_formats() {
+        let mut pixels = image::RgbImage::new(640, 360);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            let noise = ((x * 17 + y * 31 + (x * y) % 251) % 256) as u8;
+            *pixel = image::Rgb([
+                noise,
+                noise.wrapping_add((x % 93) as u8),
+                noise.wrapping_add((y % 71) as u8),
+            ]);
+        }
+        let source_image = DynamicImage::ImageRgb8(pixels);
+        let original = encode_static(source_image.clone(), "png", 100).expect("encode source png");
+        let expected = ["jpg", "webp", "png"]
+            .into_iter()
+            .map(|extension| {
+                (
+                    extension,
+                    encode_static_ref(&source_image, extension, 86)
+                        .expect("encode automatic candidate"),
+                )
+            })
+            .min_by_key(|(_, bytes)| bytes.len())
+            .expect("automatic candidate");
+        let path = std::env::temp_dir().join(format!(
+            "piclite-auto-first-pass-{}-{}.png",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, &original).expect("write source png");
+        let settings = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "auto".to_string(),
+            quality: 86,
+            scale: 100.0,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+
+        let optimized = optimize_image(&path, &settings).expect("automatic optimisation");
+        let dimensions = image::load_from_memory(&optimized.bytes)
+            .expect("decode automatic result")
+            .dimensions();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(dimensions, (640, 360));
+        assert!(optimized.bytes.len() < original.len());
+        assert_eq!(optimized.extension, expected.0);
+        assert_eq!(optimized.bytes.len(), expected.1.len());
+    }
+
+    #[test]
+    fn automatic_first_pass_preserves_transparency() {
+        let pixels = image::RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba([
+                (x * 3) as u8,
+                (y * 3) as u8,
+                ((x + y) * 2) as u8,
+                if (x + y) % 4 == 0 { 80 } else { 255 },
+            ])
+        });
+        let original = encode_static(DynamicImage::ImageRgba8(pixels), "png", 100)
+            .expect("encode transparent PNG");
+        let settings = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "auto".to_string(),
+            quality: 86,
+            scale: 100.0,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+
+        let optimized = optimize_image_data(original, "png".to_string(), &settings)
+            .expect("automatic transparent optimisation");
+        let decoded = image::load_from_memory(&optimized.bytes)
+            .expect("decode automatic transparent result")
+            .to_rgba8();
+
+        assert_ne!(optimized.extension, "jpg");
+        assert!(decoded.pixels().any(|pixel| pixel.0[3] < 255));
+    }
+
+    #[test]
+    fn automatic_first_pass_rejects_cosmetic_savings() {
+        assert!(!has_meaningful_savings(10_000, 9_950));
+        assert!(!has_meaningful_savings(100_000, 98_100));
+        assert!(has_meaningful_savings(100_000, 97_900));
+    }
+
+    #[test]
+    fn keep_format_presets_get_progressively_smaller_for_static_formats() {
+        let pixels = image::RgbImage::from_fn(320, 180, |x, y| {
+            let texture = ((x * 17 + y * 31 + (x * y) % 251) % 256) as u8;
+            image::Rgb([
+                texture,
+                texture.wrapping_add((x % 83) as u8),
+                texture.wrapping_add((y % 67) as u8),
+            ])
+        });
+        let source = DynamicImage::ImageRgb8(pixels);
+        let settings = |mode: &str, quality: u8, scale: f64| WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: mode.to_string(),
+            quality,
+            scale,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+
+        for extension in ["jpg", "png", "webp"] {
+            // Starting with an already encoded 82%-quality file reproduces the
+            // regression where the first balanced pass matched or grew and the
+            // guard incorrectly reported 0% for every preset.
+            let original = encode_static_ref(&source, extension, 82).expect("encode source");
+            let lossless = optimize_image_data(
+                original.clone(),
+                extension.to_string(),
+                &settings("lossless", 100, 100.0),
+            )
+            .expect("lossless preset");
+            let balanced = optimize_image_data(
+                original.clone(),
+                extension.to_string(),
+                &settings("balanced", 82, 100.0),
+            )
+            .expect("balanced preset");
+            let small = optimize_image_data(
+                original,
+                extension.to_string(),
+                &settings("small", 45, 75.0),
+            )
+            .expect("small preset");
+            let balanced_dimensions = image::load_from_memory(&balanced.bytes)
+                .expect("decode balanced")
+                .dimensions();
+            let small_dimensions = image::load_from_memory(&small.bytes)
+                .expect("decode small")
+                .dimensions();
+
+            assert!(
+                balanced.bytes.len() < lossless.bytes.len(),
+                "{extension}: balanced {} should be smaller than lossless {}",
+                balanced.bytes.len(),
+                lossless.bytes.len()
+            );
+            assert!(
+                small.bytes.len() < balanced.bytes.len(),
+                "{extension}: small {} should be smaller than balanced {}",
+                small.bytes.len(),
+                balanced.bytes.len()
+            );
+            assert!(balanced_dimensions.0 <= 320 && balanced_dimensions.1 <= 180);
+            assert!(small_dimensions.0 <= 240 && small_dimensions.1 <= 135);
+        }
+    }
+
+    #[test]
+    fn real_product_artwork_uses_the_super_compression_ladder() {
+        let original = include_bytes!("../../public/og.png").to_vec();
+        let settings = |mode: &str, quality: u8, scale: f64| WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: mode.to_string(),
+            quality,
+            scale,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+        let lossless = optimize_image_data(
+            original.clone(),
+            "png".to_string(),
+            &settings("lossless", 92, 100.0),
+        )
+        .expect("high-quality optimisation");
+        let balanced = optimize_image_data(
+            original.clone(),
+            "png".to_string(),
+            &settings("balanced", 82, 100.0),
+        )
+        .expect("balanced optimisation");
+        let small = optimize_image_data(
+            original.clone(),
+            "png".to_string(),
+            &settings("small", 45, 75.0),
+        )
+        .expect("small optimisation");
+
+        eprintln!(
+            "real artwork: original={} lossless={}({}) balanced={}({}) small={}({})",
+            original.len(),
+            lossless.bytes.len(),
+            lossless.extension,
+            balanced.bytes.len(),
+            balanced.extension,
+            small.bytes.len(),
+            small.extension,
+        );
+        assert!(lossless.bytes.len() < original.len());
+        assert!(balanced.bytes.len() < lossless.bytes.len());
+        assert!(small.bytes.len() < balanced.bytes.len());
+        assert_eq!(
+            image::load_from_memory(&lossless.bytes)
+                .expect("decode high-quality output")
+                .dimensions(),
+            (1731, 909)
+        );
+        assert_eq!(
+            image::load_from_memory(&balanced.bytes)
+                .expect("decode balanced output")
+                .dimensions(),
+            (1731, 909)
+        );
+    }
+
+    #[test]
+    fn automatic_quick_settings_preserve_mode_and_explicit_format() {
+        let quick = QuickCompressSettings {
+            mode: "auto".to_string(),
+            quality: 86,
+            scale: 100.0,
+            format: "image/webp".to_string(),
+            strip_metadata: true,
+            prevent_larger: true,
+            export_mode: "source".to_string(),
+            export_suffix: "-piclite".to_string(),
+            rename_template: String::new(),
+            fixed_folder: None,
+            target_size_kb: 0,
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 0,
+            max_height: 0,
+        };
+        let settings = quick_settings(&quick);
+        assert_eq!(settings.mode, "auto");
+        assert_eq!(settings.format, "image/webp");
+    }
+
+    #[test]
+    fn creator_links_are_allowed_without_opening_unrelated_sites() {
+        for url in [
+            "https://www.appmiao.com",
+            "https://space.bilibili.com/6623126",
+            "https://v.douyin.com/qmJBSlpdlgs/",
+            "https://www.youtube.com/@amiaoapp",
+            "https://x.com/amiaoapp",
+            "https://t.me/miaoaaaaa",
+            "https://github.com/amiaoapp/PicLite/releases",
+        ] {
+            assert!(
+                allowed_external_url(&Url::parse(url).expect("valid creator URL")),
+                "{url}"
+            );
+        }
+        assert!(!allowed_external_url(
+            &Url::parse("https://example.com").expect("valid unrelated URL")
+        ));
+        assert!(!allowed_external_url(
+            &Url::parse("http://www.appmiao.com").expect("valid insecure URL")
+        ));
+    }
+
+    #[test]
+    fn webp_quality_controls_lossy_output_size() {
+        let mut pixels = image::RgbaImage::new(320, 180);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            let noise = ((x * 17 + y * 31 + (x * y) % 251) % 256) as u8;
+            *pixel = image::Rgba([
+                noise,
+                noise.wrapping_add((x % 93) as u8),
+                noise.wrapping_add((y % 71) as u8),
+                255,
+            ]);
+        }
+        let image = DynamicImage::ImageRgba8(pixels);
+        let small = encode_static(image.clone(), "webp", 35).expect("encode small webp");
+        let detailed = encode_static(image, "webp", 88).expect("encode detailed webp");
+
+        assert_eq!(&small[8..12], b"WEBP");
+        assert_eq!(&detailed[8..12], b"WEBP");
+        assert!(
+            small.len() < detailed.len(),
+            "low quality WebP should be smaller: {} vs {}",
+            small.len(),
+            detailed.len()
+        );
+    }
+
+    #[test]
+    fn webp_quality_100_is_pixel_lossless() {
+        let mut pixels = image::RgbaImage::new(96, 64);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgba([
+                ((x * 7 + y * 3) % 256) as u8,
+                ((x * 2 + y * 11) % 256) as u8,
+                ((x * 13 + y * 5) % 256) as u8,
+                if (x + y) % 7 == 0 { 160 } else { 255 },
+            ]);
+        }
+        let encoded = encode_static(DynamicImage::ImageRgba8(pixels.clone()), "webp", 100)
+            .expect("encode lossless WebP");
+        let decoded = image::load_from_memory(&encoded)
+            .expect("decode lossless WebP")
+            .to_rgba8();
+
+        assert_eq!(decoded.as_raw(), pixels.as_raw());
+    }
+
+    #[test]
+    fn lossless_priority_keeps_its_requested_high_quality_setting() {
+        let quick = QuickCompressSettings {
+            mode: "lossless".to_string(),
+            quality: 92,
+            scale: 100.0,
+            format: "keep".to_string(),
+            strip_metadata: true,
+            prevent_larger: true,
+            export_mode: "source".to_string(),
+            export_suffix: "-piclite".to_string(),
+            rename_template: String::new(),
+            fixed_folder: None,
+            target_size_kb: 0,
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 0,
+            max_height: 0,
+        };
+
+        let settings = quick_settings(&quick);
+        assert_eq!(settings.mode, "lossless");
+        assert_eq!(settings.quality, 92);
+        assert_eq!(settings.scale, 100.0);
+    }
+
+    #[test]
+    fn lossless_priority_reduces_a_high_quality_jpeg_without_resizing() {
+        let pixels = image::RgbImage::from_fn(128, 96, |x, y| {
+            image::Rgb([
+                ((x * 5 + y) % 256) as u8,
+                ((x + y * 7) % 256) as u8,
+                ((x * 3 + y * 2) % 256) as u8,
+            ])
+        });
+        let original =
+            encode_static(DynamicImage::ImageRgb8(pixels), "jpg", 100).expect("encode JPEG");
+        let settings = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "lossless".to_string(),
+            quality: 92,
+            scale: 100.0,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+
+        let optimized = optimize_image_data(original.clone(), "jpg".to_string(), &settings)
+            .expect("optimise JPEG at visually high quality");
+        assert!(optimized.bytes.len() < original.len());
+        assert_eq!(
+            image::load_from_memory(&optimized.bytes)
+                .expect("decode optimised JPEG")
+                .dimensions(),
+            (128, 96)
+        );
+    }
+
+    #[test]
+    fn workbench_native_webp_modes_encode_real_webp_and_change_the_result() {
+        let mut pixels = image::RgbImage::new(640, 360);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            let noise = ((x * 19 + y * 37 + (x * y) % 241) % 256) as u8;
+            *pixel = image::Rgb([
+                noise,
+                noise.wrapping_add((x % 81) as u8),
+                noise.wrapping_add((y % 67) as u8),
+            ]);
+        }
+        let original =
+            encode_static(DynamicImage::ImageRgb8(pixels), "jpg", 95).expect("encode source JPEG");
+        let balanced = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "balanced".to_string(),
+            quality: 82,
+            scale: 100.0,
+            format: "image/webp".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+        let balanced_result = optimize_image_data(original.clone(), "jpg".to_string(), &balanced)
+            .expect("balanced native WebP");
+        let mut small = balanced.clone();
+        small.mode = "small".to_string();
+        small.quality = 45;
+        small.scale = 75.0;
+        let small_result = optimize_image_data(original.clone(), "jpg".to_string(), &small)
+            .expect("small native WebP");
+
+        assert_eq!(balanced_result.extension, "webp");
+        assert_eq!(&balanced_result.bytes[8..12], b"WEBP");
+        assert!(balanced_result.bytes.len() < original.len());
+        assert_eq!(
+            image::load_from_memory(&balanced_result.bytes)
+                .expect("decode balanced WebP")
+                .dimensions(),
+            (640, 360)
+        );
+        assert_eq!(small_result.extension, "webp");
+        assert_eq!(&small_result.bytes[8..12], b"WEBP");
+        assert!(small_result.bytes.len() < balanced_result.bytes.len());
+        assert!(
+            image::load_from_memory(&small_result.bytes)
+                .expect("decode small WebP")
+                .width()
+                < 640
+        );
+    }
+
+    #[test]
+    fn gif_delta_encoding_keeps_frames_delays_and_loop_count() {
+        let mut original = Vec::new();
+        {
+            let mut encoder = gif::Encoder::new(&mut original, 64, 64, &[]).unwrap();
+            encoder.set_repeat(gif::Repeat::Finite(3)).unwrap();
+            for i in 0..5 {
+                let mut pixels =
+                    image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 255, 255, 255]));
+                pixels.put_pixel(i, 10, image::Rgba([0, 0, 0, 255]));
+                let mut bytes = pixels.into_raw();
+                let mut frame = gif::Frame::from_rgba_speed(64, 64, &mut bytes, 30);
+                frame.delay = 5;
+                frame.dispose = gif::DisposalMethod::Keep;
+                encoder.write_frame(&frame).unwrap();
+            }
+        }
+        let result = encode_gif(&original, 64, 64, 82).unwrap();
+        assert!(result.len() <= original.len());
+        let mut decoder = gif::DecodeOptions::new()
+            .read_info(Cursor::new(&result))
+            .unwrap();
+        let mut count = 0;
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            assert_eq!(frame.delay, 5);
+            count += 1;
+        }
+        assert_eq!(count, 5);
+        assert_eq!(decoder.repeat(), gif::Repeat::Finite(3));
+        let frames = GifDecoder::new(Cursor::new(&result))
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.buffer().get_pixel(i as u32, 10).0, [0, 0, 0, 255]);
+            if i > 0 {
+                assert_eq!(
+                    frame.buffer().get_pixel(i as u32 - 1, 10).0,
+                    [255, 255, 255, 255]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_gif_sample_compresses_with_animation_preserved() {
+        let Ok(path) = std::env::var("PICLITE_GIF_FIXTURE") else {
+            return;
+        };
+        let original = fs::read(path).expect("read GIF fixture");
+        let decoder = GifDecoder::new(Cursor::new(&original)).unwrap();
+        let dimensions = decoder.dimensions();
+        let start = std::time::Instant::now();
+        let result = encode_gif(&original, dimensions.0, dimensions.1, 82).unwrap();
+        eprintln!(
+            "GIF fixture: {} -> {} bytes, {:?}",
+            original.len(),
+            result.len(),
+            start.elapsed()
+        );
+        assert!(result.len() < original.len());
+        if let Ok(output) = std::env::var("PICLITE_GIF_OUTPUT") {
+            fs::write(output, &result).unwrap();
+        }
+        let metadata = |bytes: &[u8]| {
+            let mut decoder = gif::DecodeOptions::new()
+                .read_info(Cursor::new(bytes))
+                .unwrap();
+            let dimensions = (decoder.width(), decoder.height());
+            let mut frames = Vec::new();
+            while let Some(frame) = decoder.read_next_frame().unwrap() {
+                frames.push((
+                    frame.left,
+                    frame.top,
+                    frame.width,
+                    frame.height,
+                    frame.delay,
+                    frame.dispose,
+                ));
+            }
+            (dimensions, decoder.repeat(), frames)
+        };
+        assert_eq!(metadata(&original), metadata(&result));
+    }
+
+    #[test]
+    fn animated_gif_converts_to_animated_webp_with_timing() {
+        let width = 48;
+        let height = 32;
+        let mut gif = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif);
+            encoder.set_repeat(Repeat::Infinite).expect("set GIF loop");
+            for (index, color) in [[255, 32, 32, 255], [32, 255, 32, 180], [32, 32, 255, 255]]
+                .into_iter()
+                .enumerate()
+            {
+                let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        buffer,
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(80 + index as u32 * 40, 1),
+                    ))
+                    .expect("encode GIF frame");
+            }
+        }
+
+        let webp = encode_animated_webp(&gif, width, height, 72).expect("encode animated WebP");
+        let decoded = webp::AnimDecoder::new(&webp)
+            .decode()
+            .expect("decode animated WebP");
+
+        assert_eq!(&webp[8..12], b"WEBP");
+        assert!(decoded.has_animation());
+        assert!(decoded.len() >= 3);
+        let timestamps = decoded
+            .into_iter()
+            .map(|frame| frame.get_time_ms())
+            .collect::<Vec<_>>();
+        assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn animated_webp_compression_preserves_frames_timing_loop_and_dimensions() {
+        let width = 48;
+        let height = 32;
+        let mut gif = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif);
+            encoder.set_repeat(Repeat::Infinite).expect("set GIF loop");
+            for (index, color) in [[250, 20, 40, 255], [20, 240, 60, 210], [30, 60, 250, 255]]
+                .into_iter()
+                .enumerate()
+            {
+                let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba(color));
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        buffer,
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(60 + index as u32 * 30, 1),
+                    ))
+                    .expect("encode GIF frame");
+            }
+        }
+        let original = encode_animated_webp(&gif, width, height, 84).expect("encode fixture");
+        assert!(is_animated_webp(&original));
+        let before = decode_webp_animation(&original).expect("decode fixture");
+
+        let settings = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "manual".to_string(),
+            quality: 72,
+            scale: 50.0,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: false,
+            target_size_kb: 0,
+        };
+        let optimized = optimize_image_data(original, "webp".to_string(), &settings)
+            .expect("compress animated WebP");
+        let after = decode_webp_animation(&optimized.bytes).expect("decode compressed animation");
+
+        assert_eq!(optimized.extension, "webp");
+        assert_eq!((after.width, after.height), (24, 16));
+        assert_eq!(after.frames.len(), before.frames.len());
+        assert_eq!(after.loop_count, before.loop_count);
+        assert_eq!(
+            after
+                .frames
+                .iter()
+                .map(|(_, time)| *time)
+                .collect::<Vec<_>>(),
+            before
+                .frames
+                .iter()
+                .map(|(_, time)| *time)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn animated_webp_visible_watermark_preserves_animation() {
+        let width = 16;
+        let height = 12;
+        let mut gif = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif);
+            encoder.set_repeat(Repeat::Infinite).expect("set GIF loop");
+            for color in [[20, 40, 60, 255], [70, 90, 110, 255]] {
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        image::RgbaImage::from_pixel(width, height, image::Rgba(color)),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(80, 1),
+                    ))
+                    .expect("encode GIF frame");
+            }
+        }
+        let original = encode_animated_webp(&gif, width, height, 100).expect("encode fixture");
+        let mut overlay = image::RgbaImage::new(width, height);
+        overlay.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        let overlay =
+            encode_static(DynamicImage::ImageRgba8(overlay), "png", 100).expect("encode overlay");
+        let settings = QuickCompressSettings {
+            mode: "lossless".to_string(),
+            quality: 100,
+            scale: 100.0,
+            format: "keep".to_string(),
+            strip_metadata: true,
+            prevent_larger: false,
+            export_mode: "same-folder".to_string(),
+            export_suffix: "-piclite".to_string(),
+            rename_template: String::new(),
+            fixed_folder: None,
+            target_size_kb: 0,
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 0,
+            max_height: 0,
+        };
+        let output = compress_animation_with_watermark_data(
+            original.clone(),
+            "animation.webp".to_string(),
+            settings,
+            NativeAnimationWatermark {
+                kind: "visible".to_string(),
+                data: BASE64.encode(overlay),
+                opacity: 100,
+                text: String::new(),
+                blind_strength: 3,
+            },
+        )
+        .expect("watermark animation");
+        let encoded = BASE64.decode(output.data).expect("decode output");
+        let before = decode_webp_animation(&original).expect("decode input animation");
+        let after = decode_webp_animation(&encoded).expect("decode output animation");
+
+        assert_eq!(output.extension, "webp");
+        assert!(!output.kept_original);
+        assert_eq!(after.frames.len(), before.frames.len());
+        assert_eq!(after.loop_count, before.loop_count);
+        assert_eq!(
+            after
+                .frames
+                .iter()
+                .map(|(_, time)| *time)
+                .collect::<Vec<_>>(),
+            before
+                .frames
+                .iter()
+                .map(|(_, time)| *time)
+                .collect::<Vec<_>>()
+        );
+        assert!(after
+            .frames
+            .iter()
+            .all(|(frame, _)| frame.get_pixel(0, 0).0[..3] == [255, 0, 0]));
+        assert_eq!(
+            after.frames[0].0.get_pixel(1, 1),
+            before.frames[0].0.get_pixel(1, 1),
+            "100% animation watermark encoding must remain pixel-lossless"
+        );
+    }
+
+    #[test]
+    fn blind_animation_watermark_changes_rgb_without_touching_alpha() {
+        let mut frame = image::RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 77]));
+        let prepared = prepare_animation_watermark(
+            &NativeAnimationWatermark {
+                kind: "blind".to_string(),
+                data: String::new(),
+                opacity: 100,
+                text: "测试".to_string(),
+                blind_strength: 4,
+            },
+            16,
+            16,
+        )
+        .expect("prepare blind watermark");
+        apply_animation_watermark(&mut frame, &prepared);
+
+        assert_ne!(frame.get_pixel(1, 1).0[0], 128);
+        assert_eq!(frame.get_pixel(1, 1).0[3], 77);
+        assert_eq!(frame.get_pixel(0, 0).0, [128, 128, 128, 77]);
+    }
+
+    #[test]
+    fn gif_visible_watermark_keeps_multiple_frames() {
+        let width = 16;
+        let height = 12;
+        let mut gif = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif);
+            encoder.set_repeat(Repeat::Infinite).expect("set GIF loop");
+            for color in [[20, 80, 140, 255], [140, 80, 20, 255]] {
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        image::RgbaImage::from_pixel(width, height, image::Rgba(color)),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(90, 1),
+                    ))
+                    .expect("encode GIF frame");
+            }
+        }
+        let mut overlay = image::RgbaImage::new(width, height);
+        overlay.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        let overlay =
+            encode_static(DynamicImage::ImageRgba8(overlay), "png", 100).expect("encode overlay");
+        let output = compress_animation_with_watermark_data(
+            gif,
+            "animation.gif".to_string(),
+            QuickCompressSettings {
+                mode: "balanced".to_string(),
+                quality: 82,
+                scale: 100.0,
+                format: "keep".to_string(),
+                strip_metadata: true,
+                prevent_larger: false,
+                export_mode: "same-folder".to_string(),
+                export_suffix: "-piclite".to_string(),
+                rename_template: String::new(),
+                fixed_folder: None,
+                target_size_kb: 0,
+                resize: false,
+                resize_mode: "shrink".to_string(),
+                max_width: 0,
+                max_height: 0,
+            },
+            NativeAnimationWatermark {
+                kind: "visible".to_string(),
+                data: BASE64.encode(overlay),
+                opacity: 100,
+                text: String::new(),
+                blind_strength: 3,
+            },
+        )
+        .expect("watermark GIF");
+        let encoded = BASE64.decode(output.data).expect("decode GIF output");
+        let frames = GifDecoder::new(BufReader::new(Cursor::new(encoded)))
+            .expect("decode GIF")
+            .into_frames()
+            .collect_frames()
+            .expect("collect GIF frames");
+
+        assert_eq!(output.extension, "gif");
+        assert_eq!(frames.len(), 2);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.buffer().get_pixel(0, 0).0[0] > 220));
+    }
+
+    #[test]
+    fn animated_webp_rejects_static_output_formats() {
+        let mut gif = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif);
+            encoder.set_repeat(Repeat::Infinite).expect("set GIF loop");
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                encoder
+                    .encode_frame(Frame::from_parts(
+                        image::RgbaImage::from_pixel(8, 8, image::Rgba(color)),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(80, 1),
+                    ))
+                    .expect("encode GIF frame");
+            }
+        }
+        let original = encode_animated_webp(&gif, 8, 8, 80).expect("encode fixture");
+        let mut settings = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "manual".to_string(),
+            quality: 80,
+            scale: 100.0,
+            format: "image/png".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            strip_metadata: true,
+            prevent_larger: false,
+            target_size_kb: 0,
+        };
+        let error = match optimize_image_data(original.clone(), "webp".to_string(), &settings) {
+            Ok(_) => panic!("static PNG output must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("动态 WebP"));
+        settings.format = "image/jpeg".to_string();
+        assert!(optimize_image_data(original, "webp".to_string(), &settings).is_err());
+    }
+
+    #[test]
+    fn png_quality_controls_palette_output_and_100_is_lossless() {
+        let mut pixels = image::RgbaImage::new(48, 32);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgba([
+                ((x * 11 + y * 3) % 256) as u8,
+                ((x * 5 + y * 17) % 256) as u8,
+                ((x * 19 + y * 7) % 256) as u8,
+                if (x + y) % 5 == 0 { 128 } else { 255 },
+            ]);
+        }
+
+        let webp = encode_static(DynamicImage::ImageRgba8(pixels), "webp", 92)
+            .expect("encode webp source");
+        let decoded_webp = image::load_from_memory(&webp).expect("decode webp source");
+        let expected = decoded_webp.to_rgba8();
+
+        let lossless =
+            encode_static(decoded_webp.clone(), "png", 100).expect("encode lossless png");
+        let detailed = encode_static(decoded_webp.clone(), "png", 82).expect("encode detailed png");
+        let small = encode_static(decoded_webp, "png", 25).expect("encode small png");
+        let actual_lossless = image::load_from_memory(&lossless)
+            .expect("decode lossless png")
+            .to_rgba8();
+
+        assert_eq!(actual_lossless.as_raw(), expected.as_raw());
+        assert!(
+            small.len() < detailed.len(),
+            "low-quality palette PNG should be smaller"
+        );
+        assert!(
+            detailed.len() < lossless.len(),
+            "palette PNG should be smaller than true-colour PNG"
+        );
+        assert!(image::load_from_memory(&small).is_ok());
+    }
+
+    #[test]
+    fn lossless_priority_honours_an_explicit_resize() {
+        let mut pixels = image::RgbImage::new(640, 360);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                ((x * 3 + y) % 256) as u8,
+                ((x + y * 2) % 256) as u8,
+                ((x / 3 + y / 2) % 256) as u8,
+            ]);
+        }
+        let original =
+            encode_static(DynamicImage::ImageRgb8(pixels), "jpg", 18).expect("encode source jpeg");
+        let path = std::env::temp_dir().join(format!(
+            "piclite-size-guard-{}-{}.jpg",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, &original).expect("write source jpeg");
+        let settings = WatcherSettings {
+            profiles: Vec::new(),
+            folder_rename: None,
+            only_when_needed: false,
+            notify_on_complete: true,
+            show_floating_result: false,
+            input_folder: String::new(),
+            input_folders: Vec::new(),
+            output_folder: String::new(),
+            output_suffix: String::new(),
+            rename_template: String::new(),
+            mode: "lossless".to_string(),
+            quality: 100,
+            scale: 75.0,
+            format: "keep".to_string(),
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 2560,
+            max_height: 2560,
+            strip_metadata: true,
+            prevent_larger: true,
+            target_size_kb: 0,
+        };
+
+        let optimized = optimize_bytes(&path, &settings).expect("optimize jpeg");
+        let dimensions = image::load_from_memory(&optimized)
+            .expect("decode optimized jpeg")
+            .dimensions();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(dimensions, (480, 270));
+    }
+
+    #[test]
+    fn guarded_quality_steps_are_unique_and_descending() {
+        let steps = guarded_quality_steps(100);
+        assert!(steps.windows(2).all(|pair| pair[0] > pair[1]));
+        assert_eq!(steps.last(), Some(&1));
+    }
+
+    #[test]
+    fn selected_collection_font_face_stays_parseable() {
+        let mut files = Vec::new();
+        for directory in system_font_directories() {
+            collect_font_files(&directory, 0, &mut files);
+        }
+        for path in files {
+            let Ok(data) = fs::read(path) else { continue };
+            let Some(face_count) = ttf_parser::fonts_in_collection(&data) else {
+                continue;
+            };
+            if face_count < 2 {
+                continue;
+            }
+            let selected = face_count - 1;
+            let extracted = extract_font_face(&data, selected).expect("extract collection face");
+            ttf_parser::Face::parse(&extracted, 0).expect("parse extracted collection face");
+            return;
+        }
+    }
+
+    #[test]
+    fn upload_key_removes_parent_segments_and_unsafe_file_characters() {
+        let payload = NativeUploadPayload {
+            provider: "webdav".to_string(),
+            endpoint: "https://dav.example.com".to_string(),
+            bucket: String::new(),
+            region: "auto".to_string(),
+            access_key: String::new(),
+            username: String::new(),
+            port: 0,
+            remote_path: "../piclite/./2026".to_string(),
+            public_base_url: String::new(),
+            key_path: String::new(),
+            path_style: true,
+            secret: String::new(),
+            file_name: "hello:world.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data: vec![1],
+        };
+        assert_eq!(
+            remote_object_key(&payload).expect("upload key"),
+            "piclite/2026/hello-world.png"
+        );
+    }
+
+    #[test]
+    fn public_url_encodes_unicode_without_losing_path_segments() {
+        assert_eq!(
+            joined_public_url("https://img.example.com/", "piclite/图 轻.png", "unused"),
+            "https://img.example.com/piclite/%E5%9B%BE%20%E8%BD%BB.png"
+        );
+    }
+
+    #[test]
+    fn update_versions_compare_numerically() {
+        assert!(version_is_newer("v0.11.0", "0.10.9"));
+        assert!(version_is_newer("1.0.0", "0.99.99"));
+        assert!(!version_is_newer("v0.10.0", "0.10.0"));
+        assert!(!version_is_newer("0.9.9", "0.10.0"));
+    }
+
+    #[test]
+    fn file_ingress_accepts_images_and_rejects_documents() {
+        for name in [
+            "photo.jpg",
+            "PHOTO.JPEG",
+            "graphic.png",
+            "animation.gif",
+            "modern.webp",
+            "modern.avif",
+            "scan.tiff",
+        ] {
+            assert!(is_image(Path::new(name)), "{name} should be an image");
+        }
+        for name in [
+            "report.pdf",
+            "draft.doc",
+            "draft.docx",
+            "sheet.xlsx",
+            "slides.pptx",
+            "archive.zip",
+            "image.png.pdf",
+            "no-extension",
+        ] {
+            assert!(!is_image(Path::new(name)), "{name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn folder_import_collects_supported_images_recursively_in_stable_order() {
+        let root = std::env::temp_dir().join(format!(
+            "piclite-folder-import-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create test folders");
+        fs::write(root.join("b.PNG"), b"image name only").expect("write image name");
+        fs::write(root.join("notes.pdf"), b"document").expect("write document");
+        fs::write(nested.join("a.jpg"), b"image name only").expect("write image name");
+
+        let collected = collect_image_paths(&root)
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .expect("relative path")
+                    .to_path_buf()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collected,
+            vec![PathBuf::from("b.PNG"), PathBuf::from("nested/a.jpg")]
+        );
+
+        fs::remove_dir_all(root).expect("remove test folders");
+    }
+
+    #[test]
+    fn image_entry_import_reports_total_and_incremental_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "piclite-import-progress-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).expect("create progress test folder");
+        let first = root.join("first.png");
+        let second = root.join("second.png");
+        image::RgbImage::new(3, 2)
+            .save(&first)
+            .expect("save first image");
+        image::RgbImage::new(2, 3)
+            .save(&second)
+            .expect("save second image");
+
+        let state = DesktopState::default();
+        let mut progress = Vec::new();
+        let entries = native_image_entries_from_paths_with_progress(
+            vec![first, second],
+            &state,
+            |current, total| progress.push((current, total)),
+        )
+        .expect("read image entries");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(progress, vec![(0, 2), (1, 2), (2, 2)]);
+        fs::remove_dir_all(root).expect("remove progress test folder");
+    }
+
+    #[test]
+    fn protected_clipboard_image_path_falls_back_to_bitmap_data() {
+        let protected = PathBuf::from("/private/wechat/protected-image.png");
+        assert_eq!(
+            select_readable_clipboard_image_paths(vec![protected], |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn document_file_list_does_not_fall_back_to_its_thumbnail() {
+        assert_eq!(
+            select_readable_clipboard_image_paths(
+                vec![PathBuf::from("report.pdf"), PathBuf::from("draft.docx")],
+                |_| true,
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn readable_clipboard_image_keeps_native_file_ingress() {
+        let readable = PathBuf::from("/tmp/wechat-image.jpg");
+        assert_eq!(
+            select_readable_clipboard_image_paths(
+                vec![readable.clone(), PathBuf::from("notes.pdf")],
+                |path| path == readable,
+            ),
+            Some(vec![readable])
+        );
+    }
+
+    #[test]
+    fn windows_floating_copy_keeps_the_optimised_file_payload() {
+        let path = std::env::temp_dir().join(format!("piclite-copy-result-{}.webp", now_ms()));
+        let optimised = b"optimised-result";
+        fs::write(&path, optimised).expect("write optimised result fixture");
+        let mut copied_file = None;
+        let mut copied_bitmap = false;
+
+        copy_image_path_payload_with(
+            &path,
+            image_path_clipboard_mode("windows"),
+            |candidate| {
+                copied_file = Some(candidate.to_path_buf());
+                Ok(())
+            },
+            |_| {
+                copied_bitmap = true;
+                Ok(())
+            },
+        )
+        .expect("copy optimised file");
+
+        assert_eq!(copied_file.as_deref(), Some(path.as_path()));
+        assert!(!copied_bitmap);
+        fs::remove_file(path).expect("remove optimised result fixture");
+    }
+
+    #[test]
+    fn windows_floating_copy_does_not_hide_file_copy_failures_with_a_png_fallback() {
+        let path = Path::new("result.webp");
+        let mut copied_bitmap = false;
+        let error = copy_image_path_payload_with(
+            path,
+            image_path_clipboard_mode("windows"),
+            |_| Err("clipboard locked".to_string()),
+            |_| {
+                copied_bitmap = true;
+                Ok(())
+            },
+        )
+        .expect_err("Windows file copy failure must remain visible");
+
+        assert_eq!(error, "clipboard locked");
+        assert!(!copied_bitmap);
+    }
+
+    #[test]
+    fn clipboard_fingerprint_detects_changed_pixels_without_png_encoding() {
+        let pixels = vec![24_u8; 256 * 256 * 4];
+        let original = arboard::ImageData {
+            width: 256,
+            height: 256,
+            bytes: Cow::Owned(pixels.clone()),
+        };
+        let same = arboard::ImageData {
+            width: 256,
+            height: 256,
+            bytes: Cow::Owned(pixels.clone()),
+        };
+        let mut changed_pixels = pixels;
+        let last = changed_pixels.len() - 1;
+        changed_pixels[last] = 25;
+        let changed = arboard::ImageData {
+            width: 256,
+            height: 256,
+            bytes: Cow::Owned(changed_pixels),
+        };
+
+        assert_eq!(
+            clipboard_bitmap_fingerprint(&original),
+            clipboard_bitmap_fingerprint(&same)
+        );
+        assert_ne!(
+            clipboard_bitmap_fingerprint(&original),
+            clipboard_bitmap_fingerprint(&changed)
+        );
+    }
+
+    #[test]
+    fn windows_dib_header_is_converted_to_a_decodable_bmp() {
+        // Two 24-bit pixels (red, green) stored bottom-up with DWORD padding.
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&2i32.to_le_bytes());
+        dib.extend_from_slice(&1i32.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&24u16.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&8u32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+        let bmp = dib_to_bmp_bytes(&dib).unwrap();
+        assert_eq!(&bmp[..2], b"BM");
+        let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 255, 0]);
+    }
+
+    #[test]
+    fn clipboard_sequence_change_delivers_identical_and_initial_windows_images() {
+        assert!(clipboard_payload_is_new(false, true, Some(11), None, true));
+        assert!(clipboard_payload_is_new(
+            true,
+            false,
+            Some(12),
+            Some(11),
+            false
+        ));
+        assert!(!clipboard_payload_is_new(
+            true,
+            false,
+            Some(12),
+            Some(12),
+            true
+        ));
+        assert!(clipboard_payload_is_new(true, false, None, None, true));
+    }
+
+    #[test]
+    fn batch_rename_extracts_codes_from_different_nested_folder_depths() {
+        let root = std::env::temp_dir().join(format!("PicLite 图片 - 原稿 {}", now_ms()));
+        let shallow = root.join("ABC").join("【1-1】");
+        let deep = root
+            .join("ABC")
+            .join("班级 A")
+            .join("材料")
+            .join("【11-1】")
+            .join("照片");
+        fs::create_dir_all(&shallow).expect("create shallow folder");
+        fs::create_dir_all(&deep).expect("create deep folder");
+        fs::write(
+            shallow.join("正面 图.png"),
+            b"not decoded during rename preview",
+        )
+        .expect("write shallow image");
+        fs::write(
+            deep.join("portrait.jpg"),
+            b"not decoded during rename preview",
+        )
+        .expect("write deep image");
+
+        let request = BatchRenameRequest {
+            root_folder: root.to_string_lossy().to_string(),
+            folder_pattern: r"[【\[]\s*(\d+)\s*-\s*(\d+)\s*[】\]]".to_string(),
+            rename_template: "{code}_{name}".to_string(),
+            first_padding: 2,
+            second_padding: 2,
+            word_separator: String::new(),
+            preserve_original: false,
+            output_format: "keep".into(),
+            quality: 86,
+        };
+        let preview = build_batch_rename_plan(&request).expect("build rename preview");
+        let names = preview
+            .entries
+            .iter()
+            .map(|entry| entry.target_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(preview.matched, 2);
+        assert!(names.contains(&"0101_正面 图.png"));
+        assert!(names.contains(&"1101_portrait.jpg"));
+        assert!(preview.entries.iter().all(|entry| entry.ready));
+
+        let applied = execute_batch_rename(&request).expect("apply batch rename");
+        assert_eq!(applied.renamed, 2);
+        assert!(!shallow.join("正面 图.png").exists());
+        assert!(!deep.join("portrait.jpg").exists());
+        assert!(shallow.join("0101_正面 图.png").exists());
+        assert!(deep.join("1101_portrait.jpg").exists());
+
+        fs::remove_dir_all(root).expect("remove batch rename test folder");
+    }
+
+    pub(super) fn watch_test_settings(root: &Path) -> WatcherSettings {
+        serde_json::from_value(serde_json::json!({
+            "inputFolder": root.to_string_lossy(), "outputFolder": "@same-folder",
+            "mode": "manual", "quality": 85, "scale": 100, "format": "image/jpeg",
+            "resize": true, "maxWidth": 80, "maxHeight": 80, "stripMetadata": true,
+            "preventLarger": true, "onlyWhenNeeded": true
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn watcher_floating_result_is_opt_in() {
+        let settings = watch_test_settings(Path::new("/tmp/piclite-watch"));
+        assert!(!settings.show_floating_result);
+        assert!(settings.notify_on_complete);
+    }
+
+    #[test]
+    fn jfif_decode_encode_and_watch_target_constraints() {
+        let root = std::env::temp_dir().join(format!("piclite-jfif-{}", now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("photo.JFIF");
+        let original = encode_static(DynamicImage::new_rgb8(200, 100), "jfif", 95).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(is_image(&path));
+        assert_eq!(mime_for(&path), "image/jpeg");
+        let settings = watch_test_settings(&root);
+        assert!(watched_file_needs_processing(&path, &settings).unwrap());
+        let result = optimize_image(&path, &settings).unwrap();
+        assert_eq!(result.extension, "jpg");
+        assert_eq!(
+            image::load_from_memory(&result.bytes).unwrap().dimensions(),
+            (80, 40)
+        );
+        fs::write(&path, result.bytes).unwrap();
+        assert!(!watched_file_needs_processing(&path, &settings).unwrap());
+        let mut webp = settings.clone();
+        webp.format = "image/webp".into();
+        assert!(watched_file_needs_processing(&path, &webp).unwrap());
+        assert_eq!(optimize_image(&path, &webp).unwrap().extension, "webp");
+        let mut keep = settings;
+        keep.format = "keep".into();
+        keep.only_when_needed = false;
+        let result = optimize_image(&path, &keep).unwrap();
+        assert_eq!(result.extension, "jfif");
+        assert_eq!(
+            image::guess_format(&result.bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_words_initials_and_parent_boundary() {
+        let root = Path::new("A");
+        let path = root
+            .join("A1")
+            .join("New York")
+            .join("A1111")
+            .join("p.jfif");
+        let pattern = Regex::new(r"(New York)").unwrap();
+        let (folder, matched, captures) = folder_match_for_path(&path, root, &pattern).unwrap();
+        assert_eq!(
+            batch_rename_name(
+                "{1:initials}_{name}",
+                "p",
+                "jfif",
+                &folder,
+                &matched,
+                &captures,
+                "",
+                "",
+                1
+            ),
+            "NY_p.jfif"
+        );
+        assert_eq!(
+            batch_rename_name(
+                "{1:initial}_{name}",
+                "p",
+                "jfif",
+                &folder,
+                &matched,
+                &captures,
+                "",
+                "",
+                1
+            ),
+            "N_p.jfif"
+        );
+        assert!(folder_match_for_path(&path, &root.join("A1/New York/A1111"), &pattern).is_none());
+        let chinese = Regex::new("风景").unwrap();
+        let (_, _, captures) =
+            folder_match_for_path(&root.join("风景/a/p.png"), root, &chinese).unwrap();
+        let request = BatchRenameRequest {
+            root_folder: "A".into(),
+            folder_pattern: "风景".into(),
+            rename_template: "{code}_{name}".into(),
+            first_padding: 2,
+            second_padding: 2,
+            word_separator: String::new(),
+            preserve_original: false,
+            output_format: "keep".into(),
+            quality: 86,
+        };
+        assert_eq!(rename_code(&captures, &request), "风景");
+    }
+
+    #[test]
+    fn rename_words_support_custom_connectors_for_names_and_captures() {
+        assert_eq!(
+            words_with_separator("New York-cover", "_"),
+            "New_York_cover"
+        );
+        assert_eq!(word_initials("New York-cover", "-"), "N-Y-C");
+        assert_eq!(
+            batch_rename_name(
+                "{1:initials}_{name:words}",
+                "Front cover final",
+                "png",
+                "New York-cover",
+                "New York-cover",
+                &["New York-cover".into(), "New York-cover".into()],
+                "",
+                "-",
+                1,
+            ),
+            "N-Y-C_Front-cover-final.png"
+        );
+        assert_eq!(
+            batch_rename_name(
+                "{code}_{name}",
+                "Front cover_final-draft",
+                "png",
+                "",
+                "",
+                &[],
+                "0101",
+                "_",
+                1,
+            ),
+            "0101_Front_cover_final_draft.png"
+        );
+        assert_eq!(
+            batch_rename_name(
+                "{name}",
+                "Front cover_final-draft",
+                "png",
+                "",
+                "",
+                &[],
+                "",
+                "",
+                1,
+            ),
+            "Front cover_final-draft.png"
+        );
+    }
+
+    #[test]
+    fn native_image_watermark_composites_before_encoding() {
+        let mut mark = image::RgbaImage::new(20, 10);
+        for pixel in mark.pixels_mut() {
+            *pixel = image::Rgba([255, 0, 0, 255]);
+        }
+        let mark_bytes = encode_static(DynamicImage::ImageRgba8(mark), "png", 100).unwrap();
+        let settings = NativeImageWatermark {
+            data: BASE64.encode(mark_bytes),
+            image_scale: 20.0,
+            opacity: 100,
+            rotation: 0.0,
+            layout: "single".into(),
+            density: 50.0,
+            position_x: 50.0,
+            position_y: 50.0,
+        };
+        let output = apply_native_image_watermark(DynamicImage::new_rgb8(200, 100), &settings)
+            .unwrap()
+            .to_rgba8();
+        let center = output.get_pixel(100, 50).0;
+        assert!(center[0] > 240 && center[1] < 10 && center[2] < 10);
+    }
+
+    #[test]
+    fn independent_watch_rules_conflicts_and_generated_outputs() {
+        let root = std::env::temp_dir().join(format!("piclite-watch-rules-{}", now_ms()));
+        let a = root.join("A");
+        let b = root.join("B");
+        fs::create_dir_all(a.join("child")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let mut settings = watch_test_settings(&a);
+        let mut other = watch_test_settings(&b);
+        other.format = "image/webp".into();
+        other.max_width = 40;
+        settings.profiles = vec![watch_test_settings(&a), other.clone()];
+        let rules = validated_watch_rules(&settings).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].1.format, "image/jpeg");
+        assert_eq!(rules[1].1.format, "image/webp");
+        other.input_folder = a.join("child").to_string_lossy().into();
+        settings.profiles[1] = other.clone();
+        assert!(validated_watch_rules(&settings).is_err());
+        other.input_folder = b.to_string_lossy().into();
+        other.output_folder = a.to_string_lossy().into();
+        settings.profiles[1] = other;
+        assert!(validated_watch_rules(&settings).is_err());
+        let output = a.join("0101_photo.jfif");
+        fs::write(&output, b"test").unwrap();
+        assert!(!registered_output(&output));
+        record_optimised_output(&a, &output).unwrap();
+        assert!(registered_output(&output));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watch_and_batch_share_ancestor_naming_with_mixed_files() {
+        let root = std::env::temp_dir().join(format!("piclite-naming-{}", now_ms()));
+        let folder = root.join("A1/A11/【1-1】A111/A1111");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("photo.jfif");
+        fs::write(&path, b"image").unwrap();
+        fs::write(folder.join("notes.txt"), b"notes").unwrap();
+        let request = BatchRenameRequest {
+            root_folder: root.to_string_lossy().into(),
+            folder_pattern: r"【(\d+)-(\d+)】".into(),
+            rename_template: "{code}_{name}".into(),
+            first_padding: 2,
+            second_padding: 2,
+            word_separator: String::new(),
+            preserve_original: false,
+            output_format: "keep".into(),
+            quality: 86,
+        };
+        let preview = build_batch_rename_plan(&request).unwrap();
+        assert_eq!(preview.entries.len(), 1);
+        assert_eq!(preview.entries[0].target_name, "0101_photo.jfif");
+        let mut settings = watch_test_settings(&root);
+        settings.folder_rename = Some(request.clone());
+        assert_eq!(
+            watched_output_name(&path, &settings, "jfif", 5, 1, 1).unwrap(),
+            preview.entries[0].target_name
+        );
+        fs::create_dir(folder.join("0101_photo.jfif")).unwrap();
+        let preview = build_batch_rename_plan(&request).unwrap();
+        assert!(
+            !preview
+                .entries
+                .iter()
+                .find(|e| e.source_name == "photo.jfif")
+                .unwrap()
+                .ready
+        );
+        assert_eq!(fs::read(folder.join("notes.txt")).unwrap(), b"notes");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn concurrent_watcher_outputs_never_overwrite_each_other() {
+        let root = std::env::temp_dir().join(format!("piclite-output-race-{}", now_ms()));
+        let handles = (0..8)
+            .map(|index| {
+                let root = root.clone();
+                thread::spawn(move || write_watched_output(&root, "photo.jpg", &[index]).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let outputs = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(outputs.len(), 8);
+        for output in outputs {
+            assert!(registered_output(&output));
+            assert_eq!(fs::read(output).unwrap().len(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_watch_scan_is_recursive_and_skips_the_default_output_tree() {
+        let root = std::env::temp_dir().join(format!("piclite-initial-scan-{}", now_ms()));
+        let deep = root.join("A/A1/A11");
+        let output = root.join("PicLite/nested");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(root.join("root.jpg"), b"source").unwrap();
+        fs::write(deep.join("deep.png"), b"source").unwrap();
+        fs::write(output.join("generated.webp"), b"output").unwrap();
+        let mut settings = watch_test_settings(&root);
+        settings.output_folder.clear();
+        let paths = collect_initial_watch_paths(&root, &settings);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|path| path.ends_with("root.jpg")));
+        assert!(paths.iter().any(|path| path.ends_with("deep.png")));
+        assert!(!paths
+            .iter()
+            .any(|path| path.starts_with(root.join("PicLite"))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_size_cap_reduces_a_static_image_below_the_requested_limit() {
+        let pixels = image::RgbImage::from_fn(640, 420, |x, y| {
+            let noise = ((x * 29 + y * 43 + (x * y) % 251) % 256) as u8;
+            image::Rgb([
+                noise,
+                noise.wrapping_add(x as u8),
+                noise.wrapping_add(y as u8),
+            ])
+        });
+        let original = encode_static(DynamicImage::ImageRgb8(pixels), "jpg", 96).unwrap();
+        let mut settings = watch_test_settings(Path::new("/tmp"));
+        settings.only_when_needed = false;
+        settings.resize = false;
+        settings.max_width = u32::MAX;
+        settings.max_height = u32::MAX;
+        settings.format = "image/webp".into();
+        settings.quality = 82;
+        settings.target_size_kb = 24;
+        let result = optimize_image_data(original, "jpg".into(), &settings).unwrap();
+        assert!(
+            result.bytes.len() <= 24 * 1024,
+            "{} bytes",
+            result.bytes.len()
+        );
+        assert!(image::load_from_memory(&result.bytes).is_ok());
+    }
+
+    #[test]
+    fn batch_rename_can_preserve_originals_while_converting_format() {
+        let root = std::env::temp_dir().join(format!("piclite-rename-convert-{}", now_ms()));
+        let folder = root.join("【2-3】");
+        fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("Front cover.png");
+        let pixels = image::RgbaImage::from_pixel(48, 32, image::Rgba([30, 90, 150, 255]));
+        fs::write(
+            &source,
+            encode_static(DynamicImage::ImageRgba8(pixels), "png", 100).unwrap(),
+        )
+        .unwrap();
+        let request = BatchRenameRequest {
+            root_folder: root.to_string_lossy().into(),
+            folder_pattern: r"【(\d+)-(\d+)】".into(),
+            rename_template: "{code}_{name}".into(),
+            first_padding: 2,
+            second_padding: 2,
+            word_separator: "-".into(),
+            preserve_original: true,
+            output_format: "image/webp".into(),
+            quality: 82,
+        };
+        let preview = build_batch_rename_plan(&request).unwrap();
+        assert_eq!(preview.entries[0].target_name, "0203_Front-cover.webp");
+        let result = execute_batch_rename(&request).unwrap();
+        let target = folder.join("0203_Front-cover.webp");
+        assert_eq!(result.renamed, 1);
+        assert!(source.exists());
+        assert!(target.exists());
+        assert_eq!(
+            image::guess_format(&fs::read(target).unwrap()).unwrap(),
+            image::ImageFormat::WebP
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_rename_blocks_occupied_chains_and_late_targets() {
+        let root = std::env::temp_dir().join(format!("piclite-rename-chain-{}", now_ms()));
+        let folder = root.join("【1-1】");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("photo.jpg"), b"original").unwrap();
+        fs::write(folder.join("0101_photo.jpg"), b"existing").unwrap();
+        fs::create_dir(folder.join("0101_0101_photo.jpg")).unwrap();
+        let request = BatchRenameRequest {
+            root_folder: root.to_string_lossy().into(),
+            folder_pattern: r"【(\d+)-(\d+)】".into(),
+            rename_template: "{code}_{name}".into(),
+            first_padding: 2,
+            second_padding: 2,
+            word_separator: String::new(),
+            preserve_original: false,
+            output_format: "keep".into(),
+            quality: 86,
+        };
+        assert_eq!(execute_batch_rename(&request).unwrap().renamed, 0);
+        assert_eq!(fs::read(folder.join("photo.jpg")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(folder.join("0101_photo.jpg")).unwrap(),
+            b"existing"
+        );
+        assert!(
+            move_without_overwrite(&folder.join("photo.jpg"), &folder.join("0101_photo.jpg"))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(folder.join("0101_photo.jpg")).unwrap(),
+            b"existing"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

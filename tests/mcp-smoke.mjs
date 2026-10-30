@@ -1,0 +1,54 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import gifenc from 'gifenc';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+const binary = process.env.PICLITE_BINARY || resolve('src-tauri/target/debug/piclite');
+const directory = await mkdtemp(join(tmpdir(), 'piclite-mcp-'));
+const gif = gifenc.GIFEncoder();
+for (let frame=0;frame<4;frame++) gif.writeFrame(new Uint8Array(64*48).fill(frame%2),64,48,{palette:[[255,0,0],[0,0,255]],delay:80+frame*10,repeat:0});
+gif.finish();
+const source=join(directory,'animation.gif');
+await writeFile(source,gif.bytes());
+const original=await readFile(source);
+const longSource=join(directory,'long-edge.png');
+await writeFile(longSource,await readFile(new URL('./fixtures/long-edge.png',import.meta.url)));
+async function verify(client) {
+  const list=await client.listTools(); assert.equal(list.tools.length,3);
+  const coverSource=join(directory,'cover-source.png'); await writeFile(coverSource,await readFile(new URL('./fixtures/long-edge.png',import.meta.url)));
+  const coverPath=join(directory,'transparent-cover.png');
+  const cover=await client.callTool({name:'piclite_create_cover',arguments:{imagePath:coverSource,outputPath:coverPath,config:{canvasW:600,canvasH:400,innerSize:180,transparent:true,enableShadow:false,borderType:'none',borderRadius:0}}});
+  assert.equal(cover.isError,false);
+  assert.equal(cover.structuredContent.result.width,600); assert.equal(cover.structuredContent.result.height,400); assert.equal(cover.structuredContent.result.format,'png');
+  assert.match((await readFile(coverPath)).subarray(0,8).toString('hex'),/^89504e470d0a1a0a$/);
+  assert.equal((await client.callTool({name:'piclite_create_cover',arguments:{imagePath:'relative.png'}})).isError,true);
+  const inspect=await client.callTool({name:'piclite_inspect',arguments:{path:source}});
+  assert.equal(inspect.isError,false); assert.equal(inspect.structuredContent.result.frames,4);
+  const rejected=await client.callTool({name:'piclite_compress',arguments:{paths:[longSource],format:'image/webp'}});
+  assert.match(rejected.structuredContent.result[0].error,/16383/);
+  assert.equal((await client.callTool({name:'piclite_inspect',arguments:{path:source}})).isError,false,'process survives rejected WebP encode');
+  const result=await client.callTool({name:'piclite_compress',arguments:{paths:[source],scale:50,format:'image/webp'}});
+  assert.equal(result.isError,false);
+  const [output]=result.structuredContent.result;
+  assert.ok(output.output,JSON.stringify(output));
+  const animated=await client.callTool({name:'piclite_inspect',arguments:{path:output.output}});
+  assert.equal(animated.structuredContent.result.animated,true);
+  assert.equal(animated.structuredContent.result.width,32);
+  assert.equal(animated.structuredContent.result.height,24);
+  assert.deepEqual(await readFile(source),original);
+  assert.equal((await client.callTool({name:'piclite_compress',arguments:{paths:['relative.png']}})).isError,true);
+}
+const stdio=new Client({name:'piclite-smoke',version:'1.0.0'});
+let bridge;
+try {
+ await stdio.connect(new StdioClientTransport({command:binary,args:['--mcp']})); await verify(stdio); await stdio.close();
+ bridge=spawn(process.execPath,['scripts/mcp-http.mjs'],{env:{...process.env,PICLITE_BINARY:binary,PICLITE_MCP_PORT:'3219'},stdio:['ignore','pipe','pipe']});
+ await new Promise((res,rej)=>{bridge.stderr.on('data',data=>{if(data.toString().includes('PicLite MCP:'))res();});bridge.on('exit',code=>rej(new Error(`bridge exit ${code}`)));setTimeout(()=>rej(new Error('bridge timeout')),10000).unref();});
+ const http=new Client({name:'piclite-http-smoke',version:'1.0.0'});
+ await http.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:3219/mcp')));await verify(http);await http.close();
+ console.log('PASS: SDK stdio + HTTP handshake, tools, animated compression, dimensions, source preserved, invalid WebP recovery, validation');
+} finally {await stdio.close();bridge?.kill();await rm(directory,{recursive:true,force:true});}

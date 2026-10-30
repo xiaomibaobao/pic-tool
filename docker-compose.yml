@@ -1,0 +1,21 @@
+services:
+  piclite:
+    image: ghcr.io/amiaoapp/piclite:${PICLITE_TAG:-latest}
+    container_name: piclite
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3456
+    ports:
+      - "${PICLITE_BIND:-0.0.0.0}:${PICLITE_PORT:-3456}:3456"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3456/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

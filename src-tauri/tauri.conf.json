@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PicLite",
+  "version": "2.0.2",
+  "identifier": "com.piclite.desktop",
+  "build": {
+    "beforeDevCommand": "npm run desktop:renderer:dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run desktop:renderer",
+    "frontendDist": "../desktop-dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "PicLite 图轻",
+        "width": 1120,
+        "height": 700,
+        "minWidth": 820,
+        "minHeight": 540,
+        "resizable": true,
+        "fullscreen": false,
+        "skipTaskbar": false,
+        "backgroundColor": "#e9eeea"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "GraphicsAndDesign",
+    "shortDescription": "本地优先、可自托管的图片与 GIF 压缩工作台",
+    "longDescription": "PicLite 同时提供网页端、自托管服务和跨平台桌面端，并支持剪贴板监测、文件夹监测、全局拖放区、悬浮结果和批量处理。",
+    "copyright": "Copyright © PicLite contributors",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
+  }
+}

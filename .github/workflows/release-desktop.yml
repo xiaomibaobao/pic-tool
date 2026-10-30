@@ -1,0 +1,141 @@
+name: Build desktop apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact: PicLite-Windows-x64
+          - name: Windows ARM64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            node_arch: x64
+            bundles: nsis,msi
+            artifact: PicLite-Windows-arm64
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            bundles: dmg
+            artifact: PicLite-macOS-arm64
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            artifact: PicLite-macOS-x64
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+            artifact: PicLite-Linux-x64
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: appimage,deb
+            artifact: PicLite-Linux-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          architecture: ${{ matrix.node_arch || '' }}
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux WebView dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - run: npm ci
+      - name: Typecheck and native regression tests
+        run: |
+          npx tsc --noEmit
+          npm run desktop:renderer
+          node --experimental-strip-types --test tests/operation-feedback.test.mjs tests/watch-settings.test.mjs tests/floating-window-state.test.mjs
+          cargo test --release --manifest-path src-tauri/Cargo.toml --locked --target ${{ matrix.target }}
+      - name: Build Tauri bundle
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: ${{ matrix.artifact }}-[bundle]
+
+      - name: MCP protocol integration tests
+        shell: bash
+        env:
+          PICLITE_BINARY: ${{ github.workspace }}/src-tauri/target/${{ matrix.target }}/release/piclite${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: node tests/mcp-smoke.mjs
+
+      - name: Package Windows portable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "portable/${{ matrix.artifact }}-portable"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/piclite.exe" "$dir/PicLite.exe"
+          Set-Content "$dir/portable.txt" "PicLite portable mode"
+          Copy-Item "docs/PORTABLE.txt" "$dir/README.txt"
+          Compress-Archive -Path "$dir/*" -DestinationPath "${{ matrix.artifact }}-portable.zip"
+      - name: Upload Windows portable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-portable
+          path: ${{ matrix.artifact }}-portable.zip
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mapfile -d '' files < <(find artifacts -type f -print0)
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${files[@]}" --title "PicLite 图轻 ${GITHUB_REF_NAME}" --notes-file "docs/RELEASE-${GITHUB_REF_NAME#v}.md" --repo "${GITHUB_REPOSITORY}"
+          fi
+      - name: Remove stale versioned installers after successful upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          repo, tag = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_REF_NAME']
+          version = tag.removeprefix('v')
+          release = json.loads(subprocess.check_output([
+              'gh', 'release', 'view', tag, '--repo', repo, '--json', 'assets'
+          ]))
+          for asset in release['assets']:
+              match = re.match(r'^PicLite_(\d+\.\d+\.\d+)_', asset['name'])
+              if match and match.group(1) != version:
+                  subprocess.run(['gh', 'release', 'delete-asset', tag, asset['name'],
+                                  '--repo', repo, '--yes'], check=True)
+          PY
